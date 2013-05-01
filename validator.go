@@ -30,7 +30,6 @@ func NewValidator(d Discovery, interval time.Duration) *Validator {
 	v := &Validator{
 		in:            make(chan []*url.URL),
 		interval:      interval,
-		timeout:       interval / 2,
 		broadcasts:    make(chan []Endpoint),
 		subscriptions: make(chan chan []Endpoint),
 		subscribers:   []chan []Endpoint{},
@@ -40,6 +39,8 @@ func NewValidator(d Discovery, interval time.Duration) *Validator {
 	return v
 }
 
+// Subscribe registers the passed channel to receive updates when the set of
+// valid Endpoints changes.
 func (v *Validator) Subscribe(c chan []Endpoint) {
 	v.subscriptions <- c
 }
@@ -57,23 +58,25 @@ func (v *Validator) loop() {
 
 			close(quit)
 			quit = make(chan struct{})
-			go cycle(quit, peers, v.interval, v.timeout, v.broadcasts)
+			go cycle(quit, peers, v.interval, v.broadcasts)
 			last = peers
 
 		case endpoints := <-v.broadcasts:
-			for _, subscriber := range v.subscribers {
-				go func(c chan []Endpoint) {
-					select {
-					case c <- endpoints:
-						break
-					case <-time.After(10 * time.Millisecond):
-						panic("uncoöperative Validator client")
-					}
-				}(subscriber)
-			}
+			go broadcastEndpoints(v.subscribers, endpoints)
 
 		case subscriber := <-v.subscriptions:
 			v.subscribers = append(v.subscribers, subscriber)
+		}
+	}
+}
+
+func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
+	for _, subscriber := range subscribers {
+		select {
+		case subscriber <- endpoints:
+			break
+		case <-time.After(10 * time.Millisecond):
+			panic("uncoöperative Validator client")
 		}
 	}
 }
@@ -103,13 +106,8 @@ func cmp(a, b []*url.URL) bool {
 	return true
 }
 
-func cycle(
-	quit chan struct{},
-	peers []*url.URL,
-	interval time.Duration,
-	timeout time.Duration,
-	out chan []Endpoint,
-) {
+func cycle(quit chan struct{}, peers []*url.URL, interval time.Duration, out chan []Endpoint) {
+	timeout := interval / 2
 	go func() { out <- pingAll(peers, timeout) }()
 	t := time.Tick(interval)
 	for {

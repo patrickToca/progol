@@ -6,19 +6,32 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 )
 
+// MulticastDiscovery deduces ideal peers from a multicast group which all
+// peers join.
 type MulticastDiscovery struct {
 	subscriptions chan chan []*url.URL
 	subscribers   []chan []*url.URL
 	ids           chan multicastId
 }
 
+// NewMulticastDiscovery returns a Discovery that represents a single peer
+// (myAddress, e.g. "http://1.2.3.4:8001") on a multicast group
+// (multicastAddress, e.g. "udp://224.0.0.253:1357").
+//
+// Peers are recognized and promoted as ideal as they join the multicast group.
+// Ideal peers are dropped when no heartbeat is detected in the multicast group
+// for a (short) period of time.
 func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscovery, error) {
 	me, err := url.Parse(myAddress)
 	if err != nil {
 		return nil, err
+	}
+	if !strings.HasPrefix(me.Scheme, "http") {
+		return nil, fmt.Errorf("myAddress must be an HTTP address")
 	}
 
 	group, err := net.ResolveUDPAddr("udp4", multicastAddress)
@@ -39,6 +52,8 @@ func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscov
 	return d, nil
 }
 
+// Subscribe registers the passed channel to receive updates when the set of
+// ideal peers changes.
 func (d *MulticastDiscovery) Subscribe(c chan []*url.URL) {
 	d.subscriptions <- c
 }
@@ -108,11 +123,11 @@ func (d *MulticastDiscovery) loop() {
 
 		case id := <-d.ids:
 			m[id.Peer] = time.Now()
-			go broadcast(d.subscribers, map2peers(m))
+			go broadcastPeers(d.subscribers, map2peers(m))
 
 		case <-t:
 			m = purge(m)
-			go broadcast(d.subscribers, map2peers(m))
+			go broadcastPeers(d.subscribers, map2peers(m))
 		}
 	}
 }
@@ -129,7 +144,7 @@ func purge(m map[string]time.Time) map[string]time.Time {
 	return m0
 }
 
-func broadcast(subscribers []chan []*url.URL, peers []*url.URL) {
+func broadcastPeers(subscribers []chan []*url.URL, peers []*url.URL) {
 	for _, subscriber := range subscribers {
 		select {
 		case subscriber <- peers:
