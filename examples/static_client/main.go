@@ -19,7 +19,7 @@ func init() {
 }
 
 func main() {
-	peers := []*url.URL{}
+	peers := []url.URL{}
 	for _, rawurl := range []string{
 		"http://localhost:8001",
 		"http://localhost:8002",
@@ -28,7 +28,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		peers = append(peers, peer)
+		peers = append(peers, *peer)
 	}
 
 	go func() {

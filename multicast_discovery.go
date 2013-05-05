@@ -13,8 +13,8 @@ import (
 // MulticastDiscovery deduces ideal peers from a multicast group which all
 // peers join.
 type MulticastDiscovery struct {
-	subscriptions chan chan []*url.URL
-	subscribers   []chan []*url.URL
+	subscriptions chan chan []url.URL
+	subscribers   []chan []url.URL
 	ids           chan multicastId
 }
 
@@ -40,12 +40,12 @@ func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscov
 	}
 
 	ids := make(chan multicastId)
-	go transmit(group, me)
+	go transmit(group, *me)
 	go receive(group, ids)
 
 	d := &MulticastDiscovery{
-		subscriptions: make(chan chan []*url.URL),
-		subscribers:   []chan []*url.URL{},
+		subscriptions: make(chan chan []url.URL),
+		subscribers:   []chan []url.URL{},
 		ids:           ids,
 	}
 	go d.loop()
@@ -54,7 +54,7 @@ func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscov
 
 // Subscribe registers the passed channel to receive updates when the set of
 // ideal peers changes.
-func (d *MulticastDiscovery) Subscribe(c chan []*url.URL) {
+func (d *MulticastDiscovery) Subscribe(c chan []url.URL) {
 	d.subscriptions <- c
 }
 
@@ -62,7 +62,7 @@ type multicastId struct {
 	Peer string `json:"peer"`
 }
 
-func transmit(group *net.UDPAddr, me *url.URL) {
+func transmit(group *net.UDPAddr, me url.URL) {
 	socket, err := net.DialUDP("udp4", nil, group)
 	if err != nil {
 		panic(err)
@@ -144,7 +144,7 @@ func purge(m map[string]time.Time) map[string]time.Time {
 	return m0
 }
 
-func broadcastPeers(subscribers []chan []*url.URL, peers []*url.URL) {
+func broadcastPeers(subscribers []chan []url.URL, peers []url.URL) {
 	for _, subscriber := range subscribers {
 		select {
 		case subscriber <- peers:
@@ -155,14 +155,14 @@ func broadcastPeers(subscribers []chan []*url.URL, peers []*url.URL) {
 	}
 }
 
-func map2peers(m map[string]time.Time) []*url.URL {
-	peers := []*url.URL{}
+func map2peers(m map[string]time.Time) []url.URL {
+	peers := []url.URL{}
 	for rawurl, _ := range m {
 		u, err := url.Parse(rawurl)
 		if err != nil {
 			panic(fmt.Sprintf("Multicast Discovery: '%s': %s", rawurl, err))
 		}
-		peers = append(peers, u)
+		peers = append(peers, *u)
 	}
 	return peers
 }
