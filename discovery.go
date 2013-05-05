@@ -8,4 +8,5 @@ import (
 // information as it changes.
 type Discovery interface {
 	Subscribe(chan []url.URL)
+	Unsubscribe(chan []url.URL)
 }

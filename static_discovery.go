@@ -12,3 +12,9 @@ type StaticDiscovery []url.URL
 func (d StaticDiscovery) Subscribe(c chan []url.URL) {
 	go func() { c <- ([]url.URL)(d) }()
 }
+
+// Unsubscribe is implemented only to satisfy the Discovery interface.
+// For StaticDiscovery, it is a no-op.
+func (d StaticDiscovery) Unsubscribe(c chan []url.URL) {
+	return
+}

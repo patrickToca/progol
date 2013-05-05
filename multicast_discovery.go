@@ -13,9 +13,11 @@ import (
 // MulticastDiscovery deduces ideal peers from a multicast group which all
 // peers join.
 type MulticastDiscovery struct {
-	subscriptions chan chan []url.URL
-	subscribers   []chan []url.URL
-	ids           chan multicastId
+	ttl         time.Duration
+	subscribe   chan chan []url.URL
+	unsubscribe chan chan []url.URL
+	subscribers map[chan []url.URL]struct{}
+	ids         chan multicastId
 }
 
 // NewMulticastDiscovery returns a Discovery that represents a single peer
@@ -24,8 +26,8 @@ type MulticastDiscovery struct {
 //
 // Peers are recognized and promoted as ideal as they join the multicast group.
 // Ideal peers are dropped when no heartbeat is detected in the multicast group
-// for a (short) period of time.
-func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscovery, error) {
+// for TTL (lowest resolution is 1s).
+func NewMulticastDiscovery(myAddress, multicastAddress string, ttl time.Duration) (*MulticastDiscovery, error) {
 	me, err := url.Parse(myAddress)
 	if err != nil {
 		return nil, err
@@ -44,9 +46,11 @@ func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscov
 	go receive(group, ids)
 
 	d := &MulticastDiscovery{
-		subscriptions: make(chan chan []url.URL),
-		subscribers:   []chan []url.URL{},
-		ids:           ids,
+		ttl:         ttl,
+		subscribe:   make(chan chan []url.URL),
+		unsubscribe: make(chan chan []url.URL),
+		subscribers: map[chan []url.URL]struct{}{},
+		ids:         ids,
 	}
 	go d.loop()
 	return d, nil
@@ -55,7 +59,13 @@ func NewMulticastDiscovery(myAddress, multicastAddress string) (*MulticastDiscov
 // Subscribe registers the passed channel to receive updates when the set of
 // ideal peers changes.
 func (d *MulticastDiscovery) Subscribe(c chan []url.URL) {
-	d.subscriptions <- c
+	d.subscribe <- c
+}
+
+// Subscribe unregisters the passed channel so that it will no longer receive
+// updates when the set of ideal peers changes.
+func (d *MulticastDiscovery) Unsubscribe(c chan []url.URL) {
+	d.unsubscribe <- c
 }
 
 type multicastId struct {
@@ -118,22 +128,29 @@ func (d *MulticastDiscovery) loop() {
 	m := map[string]time.Time{}
 	for {
 		select {
-		case c := <-d.subscriptions:
-			d.subscribers = append(d.subscribers, c)
+		case c := <-d.subscribe:
+			if _, ok := d.subscribers[c]; !ok {
+				d.subscribers[c] = struct{}{}
+			}
+
+		case c := <-d.unsubscribe:
+			if _, ok := d.subscribers[c]; ok {
+				delete(d.subscribers, c)
+			}
 
 		case id := <-d.ids:
 			m[id.Peer] = time.Now()
 			go broadcastPeers(d.subscribers, map2peers(m))
 
 		case <-t:
-			m = purge(m)
+			m = purge(m, d.ttl)
 			go broadcastPeers(d.subscribers, map2peers(m))
 		}
 	}
 }
 
-func purge(m map[string]time.Time) map[string]time.Time {
-	oldest := time.Now().Add(-3 * time.Second)
+func purge(m map[string]time.Time, ttl time.Duration) map[string]time.Time {
+	oldest := time.Now().Add(-ttl)
 	m0 := map[string]time.Time{}
 	for s, t := range m {
 		if t.Before(oldest) {
@@ -144,8 +161,8 @@ func purge(m map[string]time.Time) map[string]time.Time {
 	return m0
 }
 
-func broadcastPeers(subscribers []chan []url.URL, peers []url.URL) {
-	for _, subscriber := range subscribers {
+func broadcastPeers(subscribers map[chan []url.URL]struct{}, peers []url.URL) {
+	for subscriber, _ := range subscribers {
 		select {
 		case subscriber <- peers:
 			break

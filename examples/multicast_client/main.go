@@ -37,7 +37,7 @@ func main() {
 		log.Fatal(http.ListenAndServe(me.Host, nil))
 	}()
 
-	d, err := progol.NewMulticastDiscovery(*myEndpoint, multicast.Host)
+	d, err := progol.NewMulticastDiscovery(*myEndpoint, multicast.Host, 3*time.Second)
 	if err != nil {
 		log.Fatalf("creating Multicast Discovery: %s", err)
 	}

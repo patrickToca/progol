@@ -27,21 +27,23 @@ type Endpoint struct {
 // and continuously publishes the results of those validations to subscribers.
 // Subscribers must take care to maintain their subscription channel.
 type Validator struct {
-	in            chan []url.URL
-	interval      time.Duration
-	timeout       time.Duration
-	broadcasts    chan []Endpoint
-	subscriptions chan chan []Endpoint
-	subscribers   []chan []Endpoint
+	in          chan []url.URL
+	interval    time.Duration
+	timeout     time.Duration
+	broadcasts  chan []Endpoint
+	subscribe   chan chan []Endpoint
+	unsubscribe chan chan []Endpoint
+	subscribers map[chan []Endpoint]struct{}
 }
 
 func NewValidator(d Discovery, interval time.Duration) *Validator {
 	v := &Validator{
-		in:            make(chan []url.URL),
-		interval:      interval,
-		broadcasts:    make(chan []Endpoint),
-		subscriptions: make(chan chan []Endpoint),
-		subscribers:   []chan []Endpoint{},
+		in:          make(chan []url.URL),
+		interval:    interval,
+		broadcasts:  make(chan []Endpoint),
+		subscribe:   make(chan chan []Endpoint),
+		unsubscribe: make(chan chan []Endpoint),
+		subscribers: map[chan []Endpoint]struct{}{},
 	}
 	go v.loop()
 	d.Subscribe(v.in)
@@ -51,7 +53,13 @@ func NewValidator(d Discovery, interval time.Duration) *Validator {
 // Subscribe registers the passed channel to receive updates when the set of
 // valid Endpoints changes.
 func (v *Validator) Subscribe(c chan []Endpoint) {
-	v.subscriptions <- c
+	v.subscribe <- c
+}
+
+// Unsubscribe unregisters the passed channel so that it will no longer receive
+// updates when the set of valid Endpoints changes.
+func (v *Validator) Unsubscribe(c chan []Endpoint) {
+	v.unsubscribe <- c
 }
 
 func (v *Validator) loop() {
@@ -61,7 +69,7 @@ func (v *Validator) loop() {
 	for {
 		select {
 		case peers := <-v.in:
-			if cmp(peers, last) {
+			if cmpUrls(peers, last) {
 				continue
 			}
 
@@ -71,12 +79,27 @@ func (v *Validator) loop() {
 			last = peers
 
 		case endpoints := <-v.broadcasts:
-			go broadcastEndpoints(v.subscribers, endpoints)
+			go broadcastEndpoints(copySubscribers(v.subscribers), endpoints)
 
-		case subscriber := <-v.subscriptions:
-			v.subscribers = append(v.subscribers, subscriber)
+		case c := <-v.subscribe:
+			if _, ok := v.subscribers[c]; !ok {
+				v.subscribers[c] = struct{}{}
+			}
+
+		case c := <-v.unsubscribe:
+			if _, ok := v.subscribers[c]; ok {
+				delete(v.subscribers, c)
+			}
 		}
 	}
+}
+
+func copySubscribers(m map[chan []Endpoint]struct{}) []chan []Endpoint {
+	a := []chan []Endpoint{}
+	for c := range m {
+		a = append(a, c)
+	}
+	return a
 }
 
 func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
@@ -90,7 +113,7 @@ func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
 	}
 }
 
-func cmp(a, b []url.URL) bool {
+func cmpUrls(a, b []url.URL) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -117,16 +140,50 @@ func cmp(a, b []url.URL) bool {
 
 func cycle(quit chan struct{}, peers []url.URL, interval time.Duration, out chan []Endpoint) {
 	timeout := interval / 2
-	go func() { out <- pingAll(peers, timeout) }()
+	last := pingAll(peers, timeout)
+	go func() { out <- last }() // initial signal
 	t := time.Tick(interval)
 	for {
 		select {
 		case <-quit:
 			return
+
 		case <-t:
-			go func() { out <- pingAll(peers, timeout) }()
+			endpoints := pingAll(peers, timeout)
+			if cmpEndpoints(endpoints, last) {
+				continue
+			}
+			go func() { out <- endpoints }()
+			last = endpoints
 		}
 	}
+}
+
+func cmpEndpoints(a, b []Endpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	s := func(e Endpoint) string { return e.Peer.String() + fmt.Sprint(e.OK) }
+
+	aStr := sort.StringSlice{}
+	for _, e := range a {
+		aStr = append(aStr, s(e))
+	}
+	sort.Sort(aStr)
+
+	bStr := sort.StringSlice{}
+	for _, e := range b {
+		bStr = append(bStr, s(e))
+	}
+	sort.Sort(bStr)
+
+	for i, _ := range aStr {
+		if aStr[i] != bStr[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func pingAll(peers []url.URL, timeout time.Duration) []Endpoint {
@@ -161,9 +218,9 @@ func pingOne(peer url.URL, timeout time.Duration) Endpoint {
 	panic("unreachable")
 }
 
-func ping(url url.URL) error {
-	url.Path = ValidationPath
-	resp, err := http.Get(url.String())
+func ping(peer url.URL) error {
+	peer.Path = ValidationPath
+	resp, err := http.Get(peer.String())
 	if err != nil {
 		return err
 	}
