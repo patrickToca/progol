@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+const (
+	ValidationPath = "/progol/ping"
+)
+
+// ValidationHandler certifies a peer valid, when installed at ValidationPath.
+func ValidationHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
 // Endpoint represents an ideal peer, and whether or not it was verified.
 type Endpoint struct {
 	Peer *url.URL
@@ -141,7 +150,7 @@ func pingAll(peers []*url.URL, timeout time.Duration) []Endpoint {
 
 func pingOne(peer *url.URL, timeout time.Duration) Endpoint {
 	e := make(chan error)
-	go func() { e <- ping(peer.String()) }()
+	go func() { e <- ping(*peer) }()
 
 	select {
 	case <-time.After(timeout):
@@ -152,8 +161,9 @@ func pingOne(peer *url.URL, timeout time.Duration) Endpoint {
 	panic("unreachable")
 }
 
-func ping(url string) error {
-	resp, err := http.Get(url)
+func ping(url url.URL) error {
+	url.Path = ValidationPath
+	resp, err := http.Get(url.String())
 	if err != nil {
 		return err
 	}

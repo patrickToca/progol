@@ -16,7 +16,7 @@ Discovery mechanisms are included, but you're free to write your own.
 
 At the next level, a **Validation** component receives the set of ideal peers
 from the Discovery component, and "pings" each one to determine if it's alive.
-Progol defines a ping as an HTTP GET on the process endpoint at the root path,
+Progol defines a ping as an HTTP GET on the process endpoint at ValidationPath,
 and success as an HTTP 200 OK response.
 
 At the top level, your application code should subscribe to updates from the

@@ -32,9 +32,7 @@ func main() {
 	log.Printf("joining multicast group on: %s", multicast.String())
 
 	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		})
+		http.HandleFunc(progol.ValidationPath, progol.ValidationHandler)
 		log.Printf("starting HTTP server on %s", me.Host)
 		log.Fatal(http.ListenAndServe(me.Host, nil))
 	}()
