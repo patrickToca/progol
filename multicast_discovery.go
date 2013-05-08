@@ -14,9 +14,9 @@ import (
 // peers join.
 type MulticastDiscovery struct {
 	ttl         time.Duration
-	subscribe   chan chan []url.URL
-	unsubscribe chan chan []url.URL
-	subscribers map[chan []url.URL]struct{}
+	subscribe   chan chan []Peer
+	unsubscribe chan chan []Peer
+	subscribers map[chan []Peer]struct{}
 	ids         chan multicastId
 }
 
@@ -33,7 +33,7 @@ func NewMulticastDiscovery(meAddr, groupAddr string, ttl time.Duration) (*Multic
 		return nil, err
 	}
 	if !strings.HasPrefix(me.Scheme, "http") {
-		return nil, fmt.Errorf("myAddress must be an HTTP address")
+		return nil, fmt.Errorf("local address must be an HTTP address")
 	}
 
 	group, err := net.ResolveUDPAddr("udp4", groupAddr)
@@ -47,9 +47,9 @@ func NewMulticastDiscovery(meAddr, groupAddr string, ttl time.Duration) (*Multic
 
 	d := &MulticastDiscovery{
 		ttl:         ttl,
-		subscribe:   make(chan chan []url.URL),
-		unsubscribe: make(chan chan []url.URL),
-		subscribers: map[chan []url.URL]struct{}{},
+		subscribe:   make(chan chan []Peer),
+		unsubscribe: make(chan chan []Peer),
+		subscribers: map[chan []Peer]struct{}{},
 		ids:         ids,
 	}
 	go d.loop()
@@ -58,13 +58,13 @@ func NewMulticastDiscovery(meAddr, groupAddr string, ttl time.Duration) (*Multic
 
 // Subscribe registers the passed channel to receive updates when the set of
 // ideal peers changes.
-func (d *MulticastDiscovery) Subscribe(c chan []url.URL) {
+func (d *MulticastDiscovery) Subscribe(c chan []Peer) {
 	d.subscribe <- c
 }
 
 // Subscribe unregisters the passed channel so that it will no longer receive
 // updates when the set of ideal peers changes.
-func (d *MulticastDiscovery) Unsubscribe(c chan []url.URL) {
+func (d *MulticastDiscovery) Unsubscribe(c chan []Peer) {
 	d.unsubscribe <- c
 }
 
@@ -161,7 +161,7 @@ func purge(m map[string]time.Time, ttl time.Duration) map[string]time.Time {
 	return m0
 }
 
-func broadcastPeers(subscribers map[chan []url.URL]struct{}, peers []url.URL) {
+func broadcastPeers(subscribers map[chan []Peer]struct{}, peers []Peer) {
 	for subscriber, _ := range subscribers {
 		select {
 		case subscriber <- peers:
@@ -172,14 +172,14 @@ func broadcastPeers(subscribers map[chan []url.URL]struct{}, peers []url.URL) {
 	}
 }
 
-func map2peers(m map[string]time.Time) []url.URL {
-	peers := []url.URL{}
+func map2peers(m map[string]time.Time) []Peer {
+	peers := []Peer{}
 	for rawurl, _ := range m {
 		u, err := url.Parse(rawurl)
 		if err != nil {
 			panic(fmt.Sprintf("Multicast Discovery: '%s': %s", rawurl, err))
 		}
-		peers = append(peers, *u)
+		peers = append(peers, Peer{*u, false})
 	}
 	return peers
 }

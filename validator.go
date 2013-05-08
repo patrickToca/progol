@@ -27,7 +27,7 @@ type Peer struct {
 // and continuously publishes the results of those validations to subscribers.
 // Subscribers must take care to maintain their subscription channel.
 type Validator struct {
-	in          chan []url.URL
+	in          chan []Peer
 	interval    time.Duration
 	timeout     time.Duration
 	broadcasts  chan []Peer
@@ -38,7 +38,7 @@ type Validator struct {
 
 func NewValidator(d Discovery, interval time.Duration) *Validator {
 	v := &Validator{
-		in:          make(chan []url.URL),
+		in:          make(chan []Peer), // un-validated Peers
 		interval:    interval,
 		broadcasts:  make(chan []Peer),
 		subscribe:   make(chan chan []Peer),
@@ -64,19 +64,19 @@ func (v *Validator) Unsubscribe(c chan []Peer) {
 
 func (v *Validator) loop() {
 	quit := make(chan struct{}) // signal to our validation cycle
-	last := []url.URL{}         // most recent set of ideal peers
+	last := []Peer{}            // most recent set of ideal (unverified) peers
 
 	for {
 		select {
-		case urls := <-v.in:
-			if CmpUrls(urls, last) {
+		case peers := <-v.in:
+			if CmpPeers(peers, last) {
 				continue
 			}
 
 			close(quit)
 			quit = make(chan struct{})
-			go cycle(quit, urls, v.interval, v.broadcasts)
-			last = urls
+			go cycle(quit, peers, v.interval, v.broadcasts)
+			last = peers
 
 		case endpoints := <-v.broadcasts:
 			go broadcastEndpoints(copySubscribers(v.subscribers), endpoints)
@@ -140,9 +140,9 @@ func CmpUrls(a, b []url.URL) bool {
 	return true
 }
 
-func cycle(quit chan struct{}, urls []url.URL, interval time.Duration, out chan []Peer) {
+func cycle(quit chan struct{}, peers []Peer, interval time.Duration, out chan []Peer) {
 	timeout := interval / 2
-	last := pingAll(urls, timeout)
+	last := pingAll(peers, timeout)
 	go func() { out <- last }() // initial signal
 	t := time.Tick(interval)
 	for {
@@ -151,7 +151,7 @@ func cycle(quit chan struct{}, urls []url.URL, interval time.Duration, out chan 
 			return
 
 		case <-t:
-			next := pingAll(urls, timeout)
+			next := pingAll(peers, timeout)
 			if CmpPeers(next, last) {
 				continue
 			}
@@ -191,23 +191,23 @@ func CmpPeers(a, b []Peer) bool {
 	return true
 }
 
-func pingAll(urls []url.URL, timeout time.Duration) []Peer {
+func pingAll(peers []Peer, timeout time.Duration) []Peer {
 	// scatter
-	chans := make([]chan Peer, len(urls))
-	for i, u := range urls {
+	chans := make([]chan Peer, len(peers))
+	for i, p := range peers {
 		chans[i] = make(chan Peer)
 		go func(i0 int, url0 url.URL) {
 			chans[i0] <- pingOne(url0, timeout)
-		}(i, u)
+		}(i, p.URL)
 	}
 
 	// gather
-	peers := make([]Peer, len(urls))
-	for i, _ := range urls {
-		peers[i] = <-chans[i]
+	newPeers := make([]Peer, len(peers))
+	for i, _ := range peers {
+		newPeers[i] = <-chans[i]
 	}
 
-	return peers
+	return newPeers
 }
 
 func pingOne(url url.URL, timeout time.Duration) Peer {
