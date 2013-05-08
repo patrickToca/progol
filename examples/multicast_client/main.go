@@ -43,10 +43,10 @@ func main() {
 	}
 
 	v := progol.NewValidator(d, 1*time.Second)
-	c := make(chan []progol.Endpoint)
+	c := make(chan []progol.Peer)
 	go func() {
-		for endpoints := range c {
-			log.Printf("Endpoints: %v", endpoints)
+		for peers := range c {
+			log.Printf("Peers: %v", peers)
 		}
 	}()
 	v.Subscribe(c)

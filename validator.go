@@ -17,10 +17,10 @@ func ValidationHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Endpoint represents an ideal peer, and whether or not it was verified.
-type Endpoint struct {
-	Peer url.URL
-	OK   bool
+// Peer represents a node on the network.
+type Peer struct {
+	URL url.URL // HTTP
+	OK  bool    // validated
 }
 
 // Validator continuously validates a set of ideal peers from a Discovery,
@@ -30,20 +30,20 @@ type Validator struct {
 	in          chan []url.URL
 	interval    time.Duration
 	timeout     time.Duration
-	broadcasts  chan []Endpoint
-	subscribe   chan chan []Endpoint
-	unsubscribe chan chan []Endpoint
-	subscribers map[chan []Endpoint]struct{}
+	broadcasts  chan []Peer
+	subscribe   chan chan []Peer
+	unsubscribe chan chan []Peer
+	subscribers map[chan []Peer]struct{}
 }
 
 func NewValidator(d Discovery, interval time.Duration) *Validator {
 	v := &Validator{
 		in:          make(chan []url.URL),
 		interval:    interval,
-		broadcasts:  make(chan []Endpoint),
-		subscribe:   make(chan chan []Endpoint),
-		unsubscribe: make(chan chan []Endpoint),
-		subscribers: map[chan []Endpoint]struct{}{},
+		broadcasts:  make(chan []Peer),
+		subscribe:   make(chan chan []Peer),
+		unsubscribe: make(chan chan []Peer),
+		subscribers: map[chan []Peer]struct{}{},
 	}
 	go v.loop()
 	d.Subscribe(v.in)
@@ -52,13 +52,13 @@ func NewValidator(d Discovery, interval time.Duration) *Validator {
 
 // Subscribe registers the passed channel to receive updates when the set of
 // valid Endpoints changes.
-func (v *Validator) Subscribe(c chan []Endpoint) {
+func (v *Validator) Subscribe(c chan []Peer) {
 	v.subscribe <- c
 }
 
 // Unsubscribe unregisters the passed channel so that it will no longer receive
 // updates when the set of valid Endpoints changes.
-func (v *Validator) Unsubscribe(c chan []Endpoint) {
+func (v *Validator) Unsubscribe(c chan []Peer) {
 	v.unsubscribe <- c
 }
 
@@ -68,15 +68,15 @@ func (v *Validator) loop() {
 
 	for {
 		select {
-		case peers := <-v.in:
-			if CmpPeers(peers, last) {
+		case urls := <-v.in:
+			if CmpUrls(urls, last) {
 				continue
 			}
 
 			close(quit)
 			quit = make(chan struct{})
-			go cycle(quit, peers, v.interval, v.broadcasts)
-			last = peers
+			go cycle(quit, urls, v.interval, v.broadcasts)
+			last = urls
 
 		case endpoints := <-v.broadcasts:
 			go broadcastEndpoints(copySubscribers(v.subscribers), endpoints)
@@ -94,18 +94,18 @@ func (v *Validator) loop() {
 	}
 }
 
-func copySubscribers(m map[chan []Endpoint]struct{}) []chan []Endpoint {
-	a := []chan []Endpoint{}
+func copySubscribers(m map[chan []Peer]struct{}) []chan []Peer {
+	a := []chan []Peer{}
 	for c := range m {
 		a = append(a, c)
 	}
 	return a
 }
 
-func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
+func broadcastEndpoints(subscribers []chan []Peer, peers []Peer) {
 	for _, subscriber := range subscribers {
 		select {
-		case subscriber <- endpoints:
+		case subscriber <- peers:
 			break
 		case <-time.After(10 * time.Millisecond):
 			panic("uncoöperative Validator client")
@@ -113,9 +113,9 @@ func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
 	}
 }
 
-// CmpPeers returns true if the passed URL slices are the same (contain the same
+// CmpUrls returns true if the passed URL slices are the same (contain the same
 // URLs, independent of order) and false otherwise.
-func CmpPeers(a, b []url.URL) bool {
+func CmpUrls(a, b []url.URL) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -140,9 +140,9 @@ func CmpPeers(a, b []url.URL) bool {
 	return true
 }
 
-func cycle(quit chan struct{}, peers []url.URL, interval time.Duration, out chan []Endpoint) {
+func cycle(quit chan struct{}, urls []url.URL, interval time.Duration, out chan []Peer) {
 	timeout := interval / 2
-	last := pingAll(peers, timeout)
+	last := pingAll(urls, timeout)
 	go func() { out <- last }() // initial signal
 	t := time.Tick(interval)
 	for {
@@ -151,35 +151,35 @@ func cycle(quit chan struct{}, peers []url.URL, interval time.Duration, out chan
 			return
 
 		case <-t:
-			endpoints := pingAll(peers, timeout)
-			if CmpEndpoints(endpoints, last) {
+			next := pingAll(urls, timeout)
+			if CmpPeers(next, last) {
 				continue
 			}
-			go func() { out <- endpoints }()
-			last = endpoints
+			go func() { out <- next }()
+			last = next
 		}
 	}
 }
 
-// CmpEndpoints returns true if the passed Endpoints slices are identical
-// (contain the same Endpoints at the same state, independent of order) and
+// CmpPeers returns true if the passed Peer slices are identical
+// (contain the same Peers at the same state, independent of order) and
 // false otherwise.
-func CmpEndpoints(a, b []Endpoint) bool {
+func CmpPeers(a, b []Peer) bool {
 	if len(a) != len(b) {
 		return false
 	}
 
-	s := func(e Endpoint) string { return e.Peer.String() + fmt.Sprint(e.OK) }
+	s := func(p Peer) string { return p.URL.String() + fmt.Sprint(p.OK) }
 
 	aStr := sort.StringSlice{}
-	for _, e := range a {
-		aStr = append(aStr, s(e))
+	for _, p := range a {
+		aStr = append(aStr, s(p))
 	}
 	sort.Sort(aStr)
 
 	bStr := sort.StringSlice{}
-	for _, e := range b {
-		bStr = append(bStr, s(e))
+	for _, p := range b {
+		bStr = append(bStr, s(p))
 	}
 	sort.Sort(bStr)
 
@@ -191,34 +191,34 @@ func CmpEndpoints(a, b []Endpoint) bool {
 	return true
 }
 
-func pingAll(peers []url.URL, timeout time.Duration) []Endpoint {
+func pingAll(urls []url.URL, timeout time.Duration) []Peer {
 	// scatter
-	chans := make([]chan Endpoint, len(peers))
-	for i, peer := range peers {
-		chans[i] = make(chan Endpoint)
-		go func(i0 int, peer0 url.URL) {
-			chans[i0] <- pingOne(peer0, timeout)
-		}(i, peer)
+	chans := make([]chan Peer, len(urls))
+	for i, u := range urls {
+		chans[i] = make(chan Peer)
+		go func(i0 int, url0 url.URL) {
+			chans[i0] <- pingOne(url0, timeout)
+		}(i, u)
 	}
 
 	// gather
-	endpoints := make([]Endpoint, len(peers))
-	for i, _ := range peers {
-		endpoints[i] = <-chans[i]
+	peers := make([]Peer, len(urls))
+	for i, _ := range urls {
+		peers[i] = <-chans[i]
 	}
 
-	return endpoints
+	return peers
 }
 
-func pingOne(peer url.URL, timeout time.Duration) Endpoint {
+func pingOne(url url.URL, timeout time.Duration) Peer {
 	e := make(chan error)
-	go func() { e <- ping(peer) }()
+	go func() { e <- ping(url) }()
 
 	select {
 	case <-time.After(timeout):
-		return Endpoint{peer, false}
+		return Peer{url, false}
 	case err := <-e:
-		return Endpoint{peer, err == nil}
+		return Peer{url, err == nil}
 	}
 	panic("unreachable")
 }
