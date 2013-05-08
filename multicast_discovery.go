@@ -21,14 +21,14 @@ type MulticastDiscovery struct {
 }
 
 // NewMulticastDiscovery returns a Discovery that represents a single peer
-// (myAddress, e.g. "http://1.2.3.4:8001") on a multicast group
-// (multicastAddress, e.g. "udp://224.0.0.253:1357").
+// (meAddr, e.g. "http://1.2.3.4:8001") on a multicast group (groupAddr, e.g.
+// "udp://224.0.0.253:1357").
 //
 // Peers are recognized and promoted as ideal as they join the multicast group.
 // Ideal peers are dropped when no heartbeat is detected in the multicast group
-// for TTL (lowest resolution is 1s).
-func NewMulticastDiscovery(myAddress, multicastAddress string, ttl time.Duration) (*MulticastDiscovery, error) {
-	me, err := url.Parse(myAddress)
+// for a period of TTL (lowest resolution 1s).
+func NewMulticastDiscovery(meAddr, groupAddr string, ttl time.Duration) (*MulticastDiscovery, error) {
+	me, err := url.Parse(meAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +36,7 @@ func NewMulticastDiscovery(myAddress, multicastAddress string, ttl time.Duration
 		return nil, fmt.Errorf("myAddress must be an HTTP address")
 	}
 
-	group, err := net.ResolveUDPAddr("udp4", multicastAddress)
+	group, err := net.ResolveUDPAddr("udp4", groupAddr)
 	if err != nil {
 		return nil, err
 	}

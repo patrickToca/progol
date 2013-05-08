@@ -69,7 +69,7 @@ func (v *Validator) loop() {
 	for {
 		select {
 		case peers := <-v.in:
-			if cmpUrls(peers, last) {
+			if CmpPeers(peers, last) {
 				continue
 			}
 
@@ -113,7 +113,9 @@ func broadcastEndpoints(subscribers []chan []Endpoint, endpoints []Endpoint) {
 	}
 }
 
-func cmpUrls(a, b []url.URL) bool {
+// CmpPeers returns true if the passed URL slices are the same (contain the same
+// URLs, independent of order) and false otherwise.
+func CmpPeers(a, b []url.URL) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -150,7 +152,7 @@ func cycle(quit chan struct{}, peers []url.URL, interval time.Duration, out chan
 
 		case <-t:
 			endpoints := pingAll(peers, timeout)
-			if cmpEndpoints(endpoints, last) {
+			if CmpEndpoints(endpoints, last) {
 				continue
 			}
 			go func() { out <- endpoints }()
@@ -159,7 +161,10 @@ func cycle(quit chan struct{}, peers []url.URL, interval time.Duration, out chan
 	}
 }
 
-func cmpEndpoints(a, b []Endpoint) bool {
+// CmpEndpoints returns true if the passed Endpoints slices are identical
+// (contain the same Endpoints at the same state, independent of order) and
+// false otherwise.
+func CmpEndpoints(a, b []Endpoint) bool {
 	if len(a) != len(b) {
 		return false
 	}
