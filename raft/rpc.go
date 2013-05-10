@@ -33,6 +33,7 @@ type AppendEntries struct {
 type AppendEntriesResponse struct {
 	Term    uint64 `json:"term"`
 	Success bool   `json:"success"`
+	Reason  string `json:"-"`
 }
 
 type RequestVote struct {
@@ -45,4 +46,5 @@ type RequestVote struct {
 type RequestVoteResponse struct {
 	Term        uint64 `json:"term"`
 	VoteGranted bool   `json:"vote_granted"`
+	Reason      string `json:"-"`
 }

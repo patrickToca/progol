@@ -3,25 +3,29 @@ package raft
 import (
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"time"
 )
 
 const (
-	Follower  = "follower"
-	Candidate = "candidate"
-	Leader    = "leader"
+	Follower  = "Follower"
+	Candidate = "Candidate"
+	Leader    = "Leader"
 )
 
 const (
 	MinimumElectionTimeoutMs = 250
-	BroadcastIntervalMs      = MinimumElectionTimeoutMs / 20
 )
 
 func ElectionTimeout() time.Duration {
 	n := rand.Intn(MinimumElectionTimeoutMs)
 	d := MinimumElectionTimeoutMs + n
 	return time.Duration(d) * time.Millisecond
+}
+
+func BroadcastInterval() time.Duration {
+	return time.Duration(MinimumElectionTimeoutMs/20) * time.Millisecond
 }
 
 type Server struct {
@@ -44,7 +48,7 @@ func NewServer(id uint64, store io.Writer, execute func([]byte)) *Server {
 	s := &Server{
 		Id:           id,
 		State:        Follower, // "when servers start up they begin as followers"
-		Term:         0,        // TODO is this correct?
+		Term:         1,        // TODO is this correct?
 		Log:          NewLog(store, execute),
 		peers:        nil,
 		peersChan:    make(chan Peers),
@@ -100,6 +104,28 @@ func (s *Server) resetElectionTimeout() {
 	s.electionTick = time.NewTimer(ElectionTimeout()).C
 }
 
+func (s *Server) logGeneric(format string, args ...interface{}) {
+	prefix := fmt.Sprintf("id=%d term=%d state=%s: ", s.Id, s.Term, s.State)
+	log.Printf(prefix+format, args...)
+}
+
+func (s *Server) logAppendEntriesResponse(r AppendEntriesResponse, stepDown bool) {
+	s.logGeneric(
+		"got AppendEntries: success=%v (%s) stepDown=%v",
+		r.Success,
+		r.Reason,
+		stepDown,
+	)
+}
+func (s *Server) logRequestVoteResponse(r RequestVoteResponse, stepDown bool) {
+	s.logGeneric(
+		"got RequestVote: granted=%v (%s) stepDown=%v",
+		r.VoteGranted,
+		r.Reason,
+		stepDown,
+	)
+}
+
 func (s *Server) followerSelect() {
 	select {
 	case p := <-s.peersChan:
@@ -109,6 +135,7 @@ func (s *Server) followerSelect() {
 	case <-s.electionTick:
 		// 5.2 Leader election: "A follower increments its current term and
 		// transitions to candidate state."
+		s.logGeneric("election timeout, becoming candidate")
 		s.Term++
 		s.State = Candidate
 		s.resetElectionTimeout()
@@ -116,11 +143,13 @@ func (s *Server) followerSelect() {
 
 	case rpc := <-s.rpcChan:
 		switch r := rpc.Request().(type) {
-		case RequestVote:
-			resp, _ := s.handleRequestVote(r)
-			rpc.Respond(resp)
 		case AppendEntries:
-			resp, _ := s.handleAppendEntries(r)
+			resp, stepDown := s.handleAppendEntries(r)
+			s.logAppendEntriesResponse(resp, stepDown)
+			rpc.Respond(resp)
+		case RequestVote:
+			resp, stepDown := s.handleRequestVote(r)
+			s.logRequestVoteResponse(resp, stepDown)
 			rpc.Respond(resp)
 		}
 	}
@@ -141,9 +170,11 @@ func (s *Server) candidateSelect() {
 	defer canceler.Cancel()
 	votesReceived := 1 // already have a vote from myself
 	votesRequired := (s.peers.Count() / 2) + 1
+	s.logGeneric("election started, %d vote(s) required", votesRequired)
 
 	// catch a bad state
 	if votesReceived >= votesRequired {
+		s.logGeneric("%d-node cluster; I win", s.peers.Count())
 		s.State = Leader
 		return
 	}
@@ -160,6 +191,7 @@ func (s *Server) candidateSelect() {
 			continue
 
 		case r := <-responses:
+			s.logGeneric("got vote: term=%d granted=%v", r.Term, r.VoteGranted)
 			// "A candidate wins the election if it receives votes from a
 			// majority of servers in the full cluster for the same term."
 			if r.Term != s.Term {
@@ -170,6 +202,7 @@ func (s *Server) candidateSelect() {
 			}
 			// "Once a candidate wins an election, it becomes leader."
 			if votesReceived >= votesRequired {
+				s.logGeneric("%d >= %d: win", votesReceived, votesRequired)
 				s.State = Leader
 				return // win
 			}
@@ -184,6 +217,7 @@ func (s *Server) candidateSelect() {
 				// recognizes the leader as legitimate and steps down, meaning
 				// that it returns to follower state."
 				resp, stepDown := s.handleAppendEntries(r)
+				s.logAppendEntriesResponse(resp, stepDown)
 				rpc.Respond(resp)
 				if stepDown {
 					s.State = Follower
@@ -192,6 +226,7 @@ func (s *Server) candidateSelect() {
 			case RequestVote:
 				// We can also be defeated by a more recent candidate
 				resp, stepDown := s.handleRequestVote(r)
+				s.logRequestVoteResponse(resp, stepDown)
 				rpc.Respond(resp)
 				if stepDown {
 					s.State = Follower
@@ -200,6 +235,7 @@ func (s *Server) candidateSelect() {
 			}
 
 		case <-s.electionTick: //  "a period of time goes by with no winner"
+			s.logGeneric("election ended with no winner")
 			s.resetElectionTimeout()
 			return // draw
 		}
@@ -219,13 +255,14 @@ func (s *Server) leaderSelect() {
 	// AppendEntries RPCs indefinitely (even after it has responsed to the
 	// client) until all followers eventually store all log entries.
 
-	heartbeatTick := time.NewTimer(BroadcastIntervalMs * time.Millisecond).C
+	heartbeatTick := time.NewTimer(BroadcastInterval()).C
 	select {
 	case p := <-s.peersChan:
 		s.peers = p
-		return
+		return // TODO manage heartbeatTick
 
 	case <-heartbeatTick:
+		s.logGeneric("heartbeat to %d", s.peers.Count())
 		s.peers.BroadcastHeartbeat(s.Term, s.Id) // TODO manage responses?
 		return
 
@@ -233,6 +270,7 @@ func (s *Server) leaderSelect() {
 		switch r := rpc.Request().(type) {
 		case AppendEntries:
 			resp, stepDown := s.handleAppendEntries(r)
+			s.logAppendEntriesResponse(resp, stepDown)
 			rpc.Respond(resp)
 			if stepDown {
 				s.State = Follower
@@ -240,6 +278,7 @@ func (s *Server) leaderSelect() {
 			}
 		case RequestVote:
 			resp, stepDown := s.handleRequestVote(r)
+			s.logRequestVoteResponse(resp, stepDown)
 			rpc.Respond(resp)
 			if stepDown {
 				s.State = Follower
@@ -257,6 +296,7 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
+			Reason:      fmt.Sprintf("Term %d < %d", r.Term, s.Term),
 		}, false
 	}
 
@@ -273,14 +313,22 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
+			Reason:      fmt.Sprintf("already cast vote for %d", s.vote),
 		}, stepDown
 	}
 
 	// If the candidate log isn't at least as recent as ours, reject
-	if s.Log.LastTerm() > r.LastLogTerm || s.Log.LastIndex() > r.LastLogIndex {
+	if s.Log.LastIndex() > r.LastLogIndex || s.Log.LastTerm() > r.LastLogTerm {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
+			Reason: fmt.Sprintf(
+				"our index/term %d/%d > %d/%d",
+				s.Log.LastIndex(),
+				s.Log.LastTerm(),
+				r.LastLogIndex,
+				r.LastLogTerm,
+			),
 		}, stepDown
 	}
 
@@ -301,6 +349,7 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
+			Reason:  fmt.Sprintf("Term %d < %d", r.Term, s.Term),
 		}, false
 	}
 
@@ -316,25 +365,32 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 	s.resetElectionTimeout()
 
 	// Reject if log doesn't contain a matching previous entry
-	if r.PrevLogTerm != s.Log.LastTerm() {
+	if r.PrevLogIndex != s.Log.LastIndex() || r.PrevLogTerm != s.Log.LastTerm() {
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
-		}, stepDown
-	}
-	if r.PrevLogIndex != s.Log.LastIndex() {
-		return AppendEntriesResponse{
-			Term:    s.Term,
-			Success: false,
+			Reason: fmt.Sprintf(
+				"prev index/term %d/%d != %d/%d",
+				r.PrevLogIndex,
+				r.PrevLogTerm,
+				s.Log.LastIndex(),
+				s.Log.LastTerm(),
+			),
 		}, stepDown
 	}
 
 	// Append entries to the log
-	for _, entry := range r.Entries {
+	for i, entry := range r.Entries {
 		if err := s.Log.AppendEntry(entry); err != nil {
 			return AppendEntriesResponse{
 				Term:    s.Term,
 				Success: false,
+				Reason: fmt.Sprintf(
+					"AppendEntry %d/%d failed: %s",
+					i+1,
+					len(r.Entries),
+					err,
+				),
 			}, stepDown
 		}
 	}
@@ -344,6 +400,7 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
+			Reason:  fmt.Sprintf("CommitTo(%d) failed: %s", r.CommitIndex, err),
 		}, stepDown
 	}
 

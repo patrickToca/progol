@@ -6,7 +6,33 @@ import (
 	"fmt"
 	"github.com/peterbourgon/progol/raft"
 	"net/http"
+	"testing"
+	"time"
 )
+
+type nonresponsivePeer uint64
+
+func (p nonresponsivePeer) Id() uint64                  { return uint64(p) }
+func (p nonresponsivePeer) Call([]byte) ([]byte, error) { return []byte{}, nil }
+
+func TestFollowerToCandidate(t *testing.T) {
+	server := raft.NewServer(1, &bytes.Buffer{}, func([]byte) {})
+	server.SetPeers(raft.Peers{
+		2: nonresponsivePeer(2),
+		3: nonresponsivePeer(3),
+	})
+
+	if server.State != raft.Follower {
+		t.Fatalf("didn't start as Follower")
+	}
+
+	d := 2 * raft.ElectionTimeout()
+	time.Sleep(d)
+
+	if server.State != raft.Candidate {
+		t.Fatalf("after %s, not Candidate", d.String())
+	}
+}
 
 func ExampleServerOverHTTP() {
 	server := raft.NewServer(123, &bytes.Buffer{}, func([]byte) {})
