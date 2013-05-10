@@ -6,7 +6,7 @@ import (
 )
 
 func ExampleLocalCluster() {
-	noop := func([]byte) {}
+	noop := func([]byte) ([]byte, error) { return []byte{}, nil }
 
 	s1 := raft.NewServer(1, &bytes.Buffer{}, noop)
 	s2 := raft.NewServer(2, &bytes.Buffer{}, noop)

@@ -11,12 +11,13 @@ import (
 )
 
 var (
-	ErrTermTooOld        = errors.New("term too old")
-	ErrIndexTooOld       = errors.New("index too old")
-	ErrCommitIndexTooOld = errors.New("commit index too old")
-	ErrCommitIndexTooBig = errors.New("commit index too big")
-	ErrInvalidChecksum   = errors.New("invalid checksum")
-	ErrNoCommand         = errors.New("no command")
+	ErrTermTooSmall    = errors.New("term too small")
+	ErrIndexTooSmall   = errors.New("index too small")
+	ErrIndexTooBig     = errors.New("commit index too big")
+	ErrInvalidChecksum = errors.New("invalid checksum")
+	ErrNoCommand       = errors.New("no command")
+	ErrBadIndex        = errors.New("bad index")
+	ErrBadTerm         = errors.New("bad term")
 )
 
 type Log struct {
@@ -24,16 +25,90 @@ type Log struct {
 	store       io.Writer
 	entries     []LogEntry
 	commitIndex uint64
-	execute     func([]byte)
+	apply       func([]byte) ([]byte, error)
 }
 
-func NewLog(store io.Writer, execute func([]byte)) *Log {
+func NewLog(store io.Writer, apply func([]byte) ([]byte, error)) *Log {
 	return &Log{
 		store:       store,
 		entries:     []LogEntry{},
 		commitIndex: 0,
-		execute:     execute,
+		apply:       apply,
 	}
+}
+
+func (l *Log) EntriesAfter(index uint64) ([]LogEntry, uint64) {
+	l.RLock()
+	defer l.RUnlock()
+	return l.entriesAfter(index)
+}
+
+func (l *Log) entriesAfter(index uint64) ([]LogEntry, uint64) {
+	if index > uint64(len(l.entries)) {
+		panic(fmt.Sprintf("entriesAfter(%d) too big", index))
+	}
+	return l.entries[index-1:], l.entries[index-1].Term
+}
+
+// Contains returns true if a LogEntry with the given index and term exists in
+// the log.
+func (l *Log) Contains(index, term uint64) bool {
+	l.RLock()
+	defer l.RUnlock()
+	return l.contains(index, term)
+}
+
+func (l *Log) contains(index, term uint64) bool {
+	if index == 0 || uint64(len(l.entries)) < index {
+		return false
+	}
+	return l.entries[index-1].Term == term
+}
+
+// EnsureLastIs deletes all non-committed LogEntries after the given index and
+// term. It will fail if the given index doesn't exist, has already been
+// committed, or doesn't match the given term.
+//
+// This method satisfies the requirement that a LogEntry in an AppendEntries
+// call precisely follows the accompanying LastLogTerm and LastLogIndex.
+func (l *Log) EnsureLastIs(index, term uint64) error {
+	l.Lock()
+	defer l.Unlock()
+	return l.ensureLastIs(index, term)
+}
+
+func (l *Log) ensureLastIs(index, term uint64) error {
+	// Taken loosely from benbjohnson's impl
+
+	if index < l.commitIndex {
+		return ErrIndexTooSmall
+	}
+
+	if index > uint64(len(l.entries)) {
+		return ErrIndexTooBig
+	}
+
+	// It's possible that the passed index is 0. It means the leader has come to
+	// decide we need a complete log rebuild. Of course, that's only valid if we
+	// haven't committed anything, so this check comes after that one.
+	if index == 0 {
+		l.entries = []LogEntry{}
+		return nil
+	}
+
+	entry := l.entries[index-1]
+	if entry.Term != term {
+		return ErrBadTerm
+	}
+
+	l.entries = l.entries[:index]
+	return nil
+}
+
+func (l *Log) CommitIndex() uint64 {
+	l.RLock()
+	defer l.RUnlock()
+	return l.commitIndex
 }
 
 // LastIndex returns the index of the most recent log entry.
@@ -73,10 +148,10 @@ func (l *Log) appendEntry(entry LogEntry) error {
 	if len(l.entries) > 0 {
 		lastTerm := l.lastTerm()
 		if entry.Term < lastTerm {
-			return ErrTermTooOld
+			return ErrTermTooSmall
 		}
 		if entry.Term == lastTerm && entry.Index <= l.lastIndex() {
-			return ErrIndexTooOld
+			return ErrIndexTooSmall
 		}
 	}
 
@@ -96,12 +171,12 @@ func (l *Log) CommitTo(commitIndex uint64) error {
 func (l *Log) commitTo(commitIndex uint64) error {
 	// Reject old commit indexes
 	if commitIndex <= l.commitIndex {
-		return ErrCommitIndexTooOld
+		return ErrIndexTooSmall
 	}
 
 	// Reject new commit indexes
 	if commitIndex > uint64(len(l.entries)) {
-		return ErrCommitIndexTooBig
+		return ErrIndexTooBig
 	}
 
 	// Sync entries between our commit index and the passed commit index
@@ -110,7 +185,9 @@ func (l *Log) commitTo(commitIndex uint64) error {
 		if err := entry.Encode(l.store); err != nil {
 			return err
 		}
-		l.execute(entry.Command)
+		if _, err := l.apply(entry.Command); err != nil {
+			return err
+		}
 		l.commitIndex = entry.Index
 	}
 
@@ -133,6 +210,13 @@ func (e *LogEntry) Encode(w io.Writer) error {
 	if len(e.Command) <= 0 {
 		return ErrNoCommand
 	}
+	if e.Index <= 0 {
+		return ErrBadIndex
+	}
+	if e.Term <= 0 {
+		return ErrBadTerm
+	}
+
 	buf := &bytes.Buffer{}
 	if _, err := fmt.Fprintf(buf, "%016x %016x %s\n", e.Index, e.Term, e.Command); err != nil {
 		return err

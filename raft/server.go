@@ -25,7 +25,8 @@ func ElectionTimeout() time.Duration {
 }
 
 func BroadcastInterval() time.Duration {
-	return time.Duration(MinimumElectionTimeoutMs/20) * time.Millisecond
+	d := MinimumElectionTimeoutMs / 10
+	return time.Duration(d) * time.Millisecond
 }
 
 type Server struct {
@@ -37,10 +38,11 @@ type Server struct {
 	peers        Peers
 	peersChan    chan Peers
 	rpcChan      chan RPC
+	commandChan  chan []byte
 	electionTick <-chan time.Time
 }
 
-func NewServer(id uint64, store io.Writer, execute func([]byte)) *Server {
+func NewServer(id uint64, store io.Writer, apply func([]byte) ([]byte, error)) *Server {
 	if id <= 0 {
 		panic("server id must be > 0")
 	}
@@ -49,15 +51,20 @@ func NewServer(id uint64, store io.Writer, execute func([]byte)) *Server {
 		Id:           id,
 		State:        Follower, // "when servers start up they begin as followers"
 		Term:         1,        // TODO is this correct?
-		Log:          NewLog(store, execute),
+		Log:          NewLog(store, apply),
 		peers:        nil,
 		peersChan:    make(chan Peers),
 		rpcChan:      make(chan RPC),
+		commandChan:  make(chan []byte),
 		electionTick: time.NewTimer(ElectionTimeout()).C, // one-shot
 	}
 	go s.loop()
 	return s
 }
+
+// TODO Command accepts client commands, which will (hopefully) get replicated
+// across all state machines. Note that Command is completely out-of-band of
+// Raft-domain RPC.
 
 func (s *Server) Incoming(rpc RPC) {
 	s.rpcChan <- rpc
@@ -113,7 +120,7 @@ func (s *Server) logAppendEntriesResponse(r AppendEntriesResponse, stepDown bool
 	s.logGeneric(
 		"got AppendEntries: success=%v (%s) stepDown=%v",
 		r.Success,
-		r.Reason,
+		r.reason,
 		stepDown,
 	)
 }
@@ -121,7 +128,7 @@ func (s *Server) logRequestVoteResponse(r RequestVoteResponse, stepDown bool) {
 	s.logGeneric(
 		"got RequestVote: granted=%v (%s) stepDown=%v",
 		r.VoteGranted,
-		r.Reason,
+		r.reason,
 		stepDown,
 	)
 }
@@ -130,6 +137,10 @@ func (s *Server) followerSelect() {
 	select {
 	case p := <-s.peersChan:
 		s.peers = p
+		return
+
+	case <-s.commandChan:
+		// TODO fwd caller to leader somehow
 		return
 
 	case <-s.electionTick:
@@ -169,7 +180,7 @@ func (s *Server) candidateSelect() {
 	})
 	defer canceler.Cancel()
 	votesReceived := 1 // already have a vote from myself
-	votesRequired := (s.peers.Count() / 2) + 1
+	votesRequired := s.peers.Quorum()
 	s.logGeneric("election started, %d vote(s) required", votesRequired)
 
 	// catch a bad state
@@ -190,11 +201,16 @@ func (s *Server) candidateSelect() {
 			s.peers = p
 			continue
 
+		case <-s.commandChan:
+			// TODO fwd caller to leader somehow
+			continue
+
 		case r := <-responses:
 			s.logGeneric("got vote: term=%d granted=%v", r.Term, r.VoteGranted)
 			// "A candidate wins the election if it receives votes from a
 			// majority of servers in the full cluster for the same term."
 			if r.Term != s.Term {
+				// TODO what if r.Term > s.Term? do we lose the election?
 				continue
 			}
 			if r.VoteGranted {
@@ -220,6 +236,7 @@ func (s *Server) candidateSelect() {
 				s.logAppendEntriesResponse(resp, stepDown)
 				rpc.Respond(resp)
 				if stepDown {
+					s.logGeneric("stepping down to Follower")
 					s.State = Follower
 					return // lose
 				}
@@ -229,6 +246,7 @@ func (s *Server) candidateSelect() {
 				s.logRequestVoteResponse(resp, stepDown)
 				rpc.Respond(resp)
 				if stepDown {
+					s.logGeneric("stepping down to Follower")
 					s.State = Follower
 					return // lose
 				}
@@ -238,6 +256,14 @@ func (s *Server) candidateSelect() {
 			s.logGeneric("election ended with no winner")
 			s.resetElectionTimeout()
 			return // draw
+		}
+	}
+}
+
+func resetNextIndex(nextIndex map[uint64]uint64, peers Peers, idx uint64) {
+	for _, peer := range peers {
+		if _, ok := nextIndex[peer.Id()]; !ok {
+			nextIndex[peer.Id()] = idx
 		}
 	}
 }
@@ -255,37 +281,195 @@ func (s *Server) leaderSelect() {
 	// AppendEntries RPCs indefinitely (even after it has responsed to the
 	// client) until all followers eventually store all log entries.
 
-	heartbeatTick := time.NewTimer(BroadcastInterval()).C
-	select {
-	case p := <-s.peersChan:
-		s.peers = p
-		return // TODO manage heartbeatTick
+	// 5.3 Log replication: "The leader maintains a nextIndex for each follower,
+	// which is the index of the next log entry the leader will send to that
+	// follower. When a leader first comes to power it initializes all nextIndex
+	// values to the index just after the last one in its log."
+	nextIndex := map[uint64]uint64{} // followerId: nextIndex
+	resetNextIndex(nextIndex, s.peers, s.Log.LastIndex()+1)
 
-	case <-heartbeatTick:
-		s.logGeneric("heartbeat to %d", s.peers.Count())
-		s.peers.BroadcastHeartbeat(s.Term, s.Id) // TODO manage responses?
-		return
+	heartbeatTick := time.Tick(BroadcastInterval())
+	for {
+		select {
+		case p := <-s.peersChan:
+			s.peers = p
+			resetNextIndex(nextIndex, s.peers, s.Log.LastIndex()+1)
+			continue
 
-	case rpc := <-s.rpcChan:
-		switch r := rpc.Request().(type) {
-		case AppendEntries:
-			resp, stepDown := s.handleAppendEntries(r)
-			s.logAppendEntriesResponse(resp, stepDown)
-			rpc.Respond(resp)
-			if stepDown {
-				s.State = Follower
-				return // ousted
+		case cmd := <-s.commandChan:
+			_, err := s.replicateCommand(cmd, nextIndex)
+			if err != nil {
+				// TODO
 			}
-		case RequestVote:
-			resp, stepDown := s.handleRequestVote(r)
-			s.logRequestVoteResponse(resp, stepDown)
-			rpc.Respond(resp)
-			if stepDown {
-				s.State = Follower
-				return // ousted
+			// TODO fwd resp somehow
+
+		case <-heartbeatTick:
+			s.logGeneric("sending heartbeat to %d", s.peers.Count())
+			s.peers.BroadcastHeartbeat(s.Term, s.Id) // TODO manage responses?
+			continue
+
+		case rpc := <-s.rpcChan:
+			switch r := rpc.Request().(type) {
+			case AppendEntries:
+				resp, stepDown := s.handleAppendEntries(r)
+				s.logAppendEntriesResponse(resp, stepDown)
+				rpc.Respond(resp)
+				if stepDown {
+					s.State = Follower
+					return // ousted
+				}
+			case RequestVote:
+				resp, stepDown := s.handleRequestVote(r)
+				s.logRequestVoteResponse(resp, stepDown)
+				rpc.Respond(resp)
+				if stepDown {
+					s.State = Follower
+					return // ousted
+				}
 			}
 		}
 	}
+}
+
+func disjoint2(all Peers, except map[uint64]AppendEntriesResponse) Peers {
+	d := Peers{}
+	for id, peer := range all {
+		if _, ok := except[id]; ok {
+			continue
+		}
+		d[id] = peer
+	}
+	return d
+}
+
+func (s *Server) replicateCommand(cmd []byte, nextIndex map[uint64]uint64) ([]byte, error) {
+	// 5.3 Log replication: "Each client request contains a command that must
+	// eventually be executed by the replicated state machines. The leader
+	// appends the command to its log as a new entry,"
+	if err := s.Log.AppendEntry(LogEntry{
+		Index:   s.Log.LastIndex() + 1,
+		Term:    s.Term,
+		Command: cmd,
+	}); err != nil {
+		return []byte{}, err
+	}
+
+	// "then issues AppendEntries RPCs in parallel to each of the other servers
+	// to replicate the entry."
+	results := map[uint64]AppendEntriesResponse{}
+	replicationTimeoutOne := BroadcastInterval() * 2 // TODO arbitrary
+
+	// TODO this work should somehow continue indefinitely, rather than being
+	// aborted after a "hard limit" timeout. But, that means it should be
+	// modeled as some "replication" actor, which can absorb new units of
+	// replication work as the situation changes.
+	hardLimit := time.After(BroadcastInterval() * 10)
+
+	for {
+		remainingPeers := disjoint2(s.peers, results)
+
+		// scatter
+		type tuple struct {
+			FollowerId uint64
+			Response   AppendEntriesResponse
+			Err        error
+		}
+		tupleChans := []chan tuple{}
+		for _, peer := range remainingPeers {
+			c := make(chan tuple)
+			tupleChans = append(tupleChans, c)
+			go func(peer0 Peer) {
+				prevLogIndex := nextIndex[peer0.Id()]
+				entries, prevLogTerm := s.Log.EntriesAfter(prevLogIndex)
+
+				c0 := make(chan tuple)
+				go func() {
+					resp, err := peer0.AppendEntries(AppendEntries{
+						Term:         s.Term,
+						LeaderId:     s.Id, // always me
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      entries,
+						CommitIndex:  s.Log.CommitIndex(),
+					})
+					c0 <- tuple{peer0.Id(), resp, err}
+				}()
+
+				select {
+				case c <- <-c0:
+					break
+				case <-time.After(replicationTimeoutOne):
+					c <- tuple{peer0.Id(), AppendEntriesResponse{}, ErrTimeout}
+				}
+			}(peer)
+		}
+
+		// gather
+		for _, tupleChan := range tupleChans {
+			tuple := <-tupleChan
+
+			// Unknown failure
+			if tuple.Err != nil {
+				s.logGeneric(
+					"replicate command to %d: %s (will retry, same nextIndex)",
+					tuple.FollowerId,
+					tuple.Err,
+				)
+				continue
+			}
+
+			// Rejection
+			if !tuple.Response.Success {
+				// "After a rejection, the leader decrements nextIndex and
+				// retries the AppendEntries RPC."
+				if nextIndex[tuple.FollowerId] == 0 {
+					panic("an AppendEntries with nextIndex == 0 failed")
+				}
+				nextIndex[tuple.FollowerId]--
+				s.logGeneric(
+					"replicate command to %d: failed (will retry w/ nextIndex=%d)",
+					tuple.FollowerId,
+					tuple.Err,
+					nextIndex[tuple.FollowerId],
+				)
+				continue
+			}
+
+			// Weird condition we should nevertheless check for: Success, and:
+			if tuple.Response.Term != s.Term {
+				panic(fmt.Sprintf(
+					"presumably impossible: success=%v term=%d myTerm=%d",
+					tuple.Response.Success,
+					tuple.Response.Term,
+					s.Term,
+				))
+			}
+
+			// Success
+			results[tuple.FollowerId] = tuple.Response // Success = true
+		}
+
+		// "When the leader decides that a log entry is committed, it applies
+		// the entry to its state machine and returns the result of that
+		// execution to the client."
+		canBeCommitted := len(results) >= s.peers.Quorum()
+		if canBeCommitted {
+			if err := s.Log.CommitTo(s.Log.LastIndex()); err != nil {
+				return []byte{}, err
+			}
+			return s.Log.apply(cmd)
+		}
+
+		// TODO this is not a valid mechanism of giving up
+		select {
+		case <-hardLimit:
+			s.logGeneric("replication attempts timed out; aborting")
+			return []byte{}, ErrTimeout
+		default:
+			break // try again...
+		}
+	}
+	panic("unreachable")
 }
 
 func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
@@ -296,7 +480,7 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
-			Reason:      fmt.Sprintf("Term %d < %d", r.Term, s.Term),
+			reason:      fmt.Sprintf("Term %d < %d", r.Term, s.Term),
 		}, false
 	}
 
@@ -313,7 +497,7 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
-			Reason:      fmt.Sprintf("already cast vote for %d", s.vote),
+			reason:      fmt.Sprintf("already cast vote for %d", s.vote),
 		}, stepDown
 	}
 
@@ -322,7 +506,7 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 		return RequestVoteResponse{
 			Term:        s.Term,
 			VoteGranted: false,
-			Reason: fmt.Sprintf(
+			reason: fmt.Sprintf(
 				"our index/term %d/%d > %d/%d",
 				s.Log.LastIndex(),
 				s.Log.LastTerm(),
@@ -344,12 +528,16 @@ func (s *Server) handleRequestVote(r RequestVote) (RequestVoteResponse, bool) {
 func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bool) {
 	// Spec is ambiguous here; basing this on benbjohnson's impl
 
+	// Maybe a nicer way to handle this is to define explicit handler functions
+	// for each Server state. Then, we won't try to hide too much logic (i.e.
+	// too many protocol rules) in one code path.
+
 	// If the request is from an old term, reject
 	if r.Term < s.Term {
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
-			Reason:  fmt.Sprintf("Term %d < %d", r.Term, s.Term),
+			reason:  fmt.Sprintf("Term %d < %d", r.Term, s.Term),
 		}, false
 	}
 
@@ -365,16 +553,15 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 	s.resetElectionTimeout()
 
 	// Reject if log doesn't contain a matching previous entry
-	if r.PrevLogIndex != s.Log.LastIndex() || r.PrevLogTerm != s.Log.LastTerm() {
+	if err := s.Log.EnsureLastIs(r.PrevLogIndex, r.PrevLogTerm); err != nil {
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
-			Reason: fmt.Sprintf(
-				"prev index/term %d/%d != %d/%d",
+			reason: fmt.Sprintf(
+				"while ensuring last log entry had index=%d term=%d: error: %s",
 				r.PrevLogIndex,
 				r.PrevLogTerm,
-				s.Log.LastIndex(),
-				s.Log.LastTerm(),
+				err,
 			),
 		}, stepDown
 	}
@@ -385,7 +572,7 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 			return AppendEntriesResponse{
 				Term:    s.Term,
 				Success: false,
-				Reason: fmt.Sprintf(
+				reason: fmt.Sprintf(
 					"AppendEntry %d/%d failed: %s",
 					i+1,
 					len(r.Entries),
@@ -400,7 +587,7 @@ func (s *Server) handleAppendEntries(r AppendEntries) (AppendEntriesResponse, bo
 		return AppendEntriesResponse{
 			Term:    s.Term,
 			Success: false,
-			Reason:  fmt.Sprintf("CommitTo(%d) failed: %s", r.CommitIndex, err),
+			reason:  fmt.Sprintf("CommitTo(%d) failed: %s", r.CommitIndex, err),
 		}, stepDown
 	}
 

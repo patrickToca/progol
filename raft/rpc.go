@@ -6,9 +6,9 @@ import (
 )
 
 type RPC struct {
-	Procedure interface{}
-	Writer    io.Writer
-	Done      chan struct{}
+	Procedure interface{}   // AppendEntries or RequestVote
+	Writer    io.Writer     // where the Server will write the Response
+	Done      chan struct{} // signal the Server is finished
 }
 
 func (rpc *RPC) Request() interface{} {
@@ -33,7 +33,7 @@ type AppendEntries struct {
 type AppendEntriesResponse struct {
 	Term    uint64 `json:"term"`
 	Success bool   `json:"success"`
-	Reason  string `json:"-"`
+	reason  string
 }
 
 type RequestVote struct {
@@ -46,5 +46,5 @@ type RequestVote struct {
 type RequestVoteResponse struct {
 	Term        uint64 `json:"term"`
 	VoteGranted bool   `json:"vote_granted"`
-	Reason      string `json:"-"`
+	reason      string
 }

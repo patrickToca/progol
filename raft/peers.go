@@ -13,81 +13,71 @@ var (
 	ErrInvalidRequest = errors.New("invalid request")
 )
 
-// Peer provides an RPC interface to a Server.
+// Peer is anything which provides a Raft-domain interface to a Server. Peer is
+// an interface to facilitate making Servers available over different transport
+// mechanisms (e.g. pure local, net/rpc, Protobufs, HTTP...). All Peers should
+// be 1:1 with a Server.
 type Peer interface {
 	Id() uint64
-	Call([]byte) ([]byte, error) // TODO maybe not the best interface
+	AppendEntries(AppendEntries) (AppendEntriesResponse, error)
+	RequestVote(RequestVote) (RequestVoteResponse, error)
 }
 
-// LocalPeer is the simplest kind of Peer.
-// It should be 1:1 with a Server.
+// LocalPeer is the simplest kind of Peer, mapped to a Server in the
+// same process-space. Useful for testing and demonstration; not so
+// useful for networks of independent processes.
 type LocalPeer struct {
 	server *Server
 }
 
-func NewLocalPeer(server *Server) *LocalPeer {
-	return &LocalPeer{
-		server: server,
-	}
-}
+func NewLocalPeer(server *Server) *LocalPeer { return &LocalPeer{server} }
 
 func (p *LocalPeer) Id() uint64 { return p.server.Id }
 
-func (p *LocalPeer) Call(req []byte) ([]byte, error) {
-	var ae AppendEntries
-	if err := json.Unmarshal(req, &ae); err != nil && ae.Term > 0 {
-		b := &bytes.Buffer{}
-		d := make(chan struct{})
-		p.server.Incoming(RPC{
-			Procedure: ae,
-			Writer:    b,
-			Done:      d,
-		})
-		<-d
-		return b.Bytes(), nil
-	}
+func (p *LocalPeer) AppendEntries(ae AppendEntries) (AppendEntriesResponse, error) {
+	b := &bytes.Buffer{}
+	d := make(chan struct{})
+	p.server.Incoming(RPC{
+		Procedure: ae,
+		Writer:    b,
+		Done:      d,
+	})
+	<-d
 
-	var rv RequestVote
-	if err := json.Unmarshal(req, &rv); err != nil && rv.Term > 0 {
-		b := &bytes.Buffer{}
-		d := make(chan struct{})
-		p.server.Incoming(RPC{
-			Procedure: rv,
-			Writer:    b,
-			Done:      d,
-		})
-		<-d
-		return b.Bytes(), nil
-	}
-
-	return []byte{}, ErrInvalidRequest
+	var aer AppendEntriesResponse
+	err := json.NewDecoder(b).Decode(&aer)
+	return aer, err
 }
 
-func DoRequestVote(p Peer, r RequestVote) (RequestVoteResponse, error) {
-	timeout := 25 * time.Millisecond
+func (p *LocalPeer) RequestVote(rv RequestVote) (RequestVoteResponse, error) {
+	b := &bytes.Buffer{}
+	d := make(chan struct{})
+	p.server.Incoming(RPC{
+		Procedure: rv,
+		Writer:    b,
+		Done:      d,
+	})
+	<-d
 
+	var rvr RequestVoteResponse
+	err := json.NewDecoder(b).Decode(&rvr)
+	return rvr, err
+}
+
+func DoRequestVote(p Peer, r RequestVote, timeout time.Duration) (RequestVoteResponse, error) {
 	type tuple struct {
-		Response []byte
+		Response RequestVoteResponse
 		Err      error
 	}
-	reqBuf, _ := json.Marshal(r)
 	c := make(chan tuple)
 	go func() {
-		resp, err := p.Call(reqBuf)
-		c <- tuple{resp, err}
+		rvr, err := p.RequestVote(r)
+		c <- tuple{rvr, err}
 	}()
 
 	select {
 	case t := <-c:
-		if t.Err != nil {
-			return RequestVoteResponse{}, t.Err
-		}
-		var resp RequestVoteResponse
-		if err := json.Unmarshal(t.Response, &resp); err != nil {
-			return RequestVoteResponse{}, err
-		}
-		return resp, nil
-
+		return t.Response, t.Err
 	case <-time.After(timeout):
 		return RequestVoteResponse{}, ErrTimeout
 	}
@@ -100,18 +90,30 @@ type Peers map[uint64]Peer
 
 func (p Peers) Count() int { return len(p) }
 
+func (p Peers) Quorum() int {
+	switch n := len(p); n {
+	case 0, 1:
+		return 1
+	default:
+		return (n / 2) + 1
+	}
+	panic("unreachable")
+}
+
+// BroadcastHeartbeat sends a heartbeat (AppendEntries RPC with no entries)
+// to every peer in Peers, serially. It ignores responses.
 func (p Peers) BroadcastHeartbeat(term, leaderId uint64) {
-	command, _ := json.Marshal(AppendEntries{
+	ae := AppendEntries{
 		Term:     term,
 		LeaderId: leaderId,
-	})
+	}
 
 	for id, peer := range p {
 		// TODO is it OK this is synchronous and serial?
 		// TODO is it OK to ignore responses?
-		if _, err := peer.Call(command); err != nil {
+		if _, err := peer.AppendEntries(ae); err != nil {
 			log.Printf(
-				"BroadcastHeartbeat: term=%d leader=%d: to=%d: %s",
+				"BroadcastHeartbeat: term=%d leader=%d: to=%d: error: %s",
 				term,
 				leaderId,
 				id,
@@ -121,6 +123,12 @@ func (p Peers) BroadcastHeartbeat(term, leaderId uint64) {
 	}
 }
 
+// RequestVotes sends the passed RequestVote RPC to every peer in Peers. It
+// forwards responses along the returned RequestVoteResponse channel. It calls
+// DoRequestVote with a timeout of BroadcastInterval * 2 (chosen arbitrarily).
+// Peers that don't respond within the timeout are retried forever. The retry
+// loop stops only when all peers have responded, or a Cancel signal is sent via
+// the returned Canceler.
 func (p Peers) RequestVotes(r RequestVote) (chan RequestVoteResponse, Canceler) {
 	// "[A server entering the candidate stage] issues RequestVote RPCs in
 	// parallel to each of the other servers in the cluster. If the candidate
@@ -154,7 +162,7 @@ func (p Peers) RequestVotes(r RequestVote) (chan RequestVoteResponse, Canceler) 
 			for id, peer := range notYetResponded {
 				tupleChans[id] = make(chan tuple)
 				go func(id0 uint64, peer0 Peer) {
-					resp, err := DoRequestVote(peer0, r)
+					resp, err := DoRequestVote(peer0, r, 2*BroadcastInterval())
 					tupleChans[id0] <- tuple{id0, resp, err}
 				}(id, peer)
 			}
