@@ -37,17 +37,24 @@ func NewLog(store io.Writer, apply func([]byte) ([]byte, error)) *Log {
 	}
 }
 
-func (l *Log) EntriesAfter(index uint64) ([]LogEntry, uint64) {
+func (l *Log) EntriesAfter(index, defaultTerm uint64) ([]LogEntry, uint64) {
 	l.RLock()
 	defer l.RUnlock()
-	return l.entriesAfter(index)
+	return l.entriesAfter(index, defaultTerm)
 }
 
-func (l *Log) entriesAfter(index uint64) ([]LogEntry, uint64) {
-	if index > uint64(len(l.entries)) {
-		panic(fmt.Sprintf("entriesAfter(%d) too big", index))
+func (l *Log) entriesAfter(index, defaultTerm uint64) ([]LogEntry, uint64) {
+	i := 0
+	for ; i < len(l.entries); i++ {
+		if l.entries[i].Index > index {
+			break
+		}
 	}
-	return l.entries[index-1:], l.entries[index-1].Term
+	a := l.entries[i:]
+	if len(a) == 0 {
+		return a, defaultTerm
+	}
+	return a, a[len(a)-1].Term
 }
 
 // Contains returns true if a LogEntry with the given index and term exists in
@@ -119,7 +126,10 @@ func (l *Log) LastIndex() uint64 {
 }
 
 func (l *Log) lastIndex() uint64 {
-	return uint64(len(l.entries))
+	if len(l.entries) <= 0 {
+		return 0
+	}
+	return l.entries[len(l.entries)-1].Index
 }
 
 // LastTerm returns the term of the most recent log entry.
@@ -170,7 +180,7 @@ func (l *Log) CommitTo(commitIndex uint64) error {
 
 func (l *Log) commitTo(commitIndex uint64) error {
 	// Reject old commit indexes
-	if commitIndex <= l.commitIndex {
+	if commitIndex < l.commitIndex {
 		return ErrIndexTooSmall
 	}
 

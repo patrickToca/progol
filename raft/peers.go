@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"log"
 	"time"
 )
 
@@ -88,6 +87,17 @@ func DoRequestVote(p Peer, r RequestVote, timeout time.Duration) (RequestVoteRes
 // functions for actions that should apply to multiple Peers.
 type Peers map[uint64]Peer
 
+func (p Peers) Except(id uint64) Peers {
+	except := Peers{}
+	for id0, peer := range p {
+		if id0 == id {
+			continue
+		}
+		except[id0] = peer
+	}
+	return except
+}
+
 func (p Peers) Count() int { return len(p) }
 
 func (p Peers) Quorum() int {
@@ -98,29 +108,6 @@ func (p Peers) Quorum() int {
 		return (n / 2) + 1
 	}
 	panic("unreachable")
-}
-
-// BroadcastHeartbeat sends a heartbeat (AppendEntries RPC with no entries)
-// to every peer in Peers, serially. It ignores responses.
-func (p Peers) BroadcastHeartbeat(term, leaderId uint64) {
-	ae := AppendEntries{
-		Term:     term,
-		LeaderId: leaderId,
-	}
-
-	for id, peer := range p {
-		// TODO is it OK this is synchronous and serial?
-		// TODO is it OK to ignore responses?
-		if _, err := peer.AppendEntries(ae); err != nil {
-			log.Printf(
-				"BroadcastHeartbeat: term=%d leader=%d: to=%d: error: %s",
-				term,
-				leaderId,
-				id,
-				err,
-			)
-		}
-	}
 }
 
 // RequestVotes sends the passed RequestVote RPC to every peer in Peers. It

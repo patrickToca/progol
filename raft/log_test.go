@@ -8,6 +8,87 @@ import (
 	"testing"
 )
 
+func TestLogEntriesAfter(t *testing.T) {
+	c := []byte(`{}`)
+	buf := &bytes.Buffer{}
+	noop := func([]byte) ([]byte, error) { return []byte{}, nil }
+	log := raft.NewLog(buf, noop)
+	defaultTerm := uint64(5)
+
+	type tuple struct {
+		After           uint64
+		ExpectedEntries int
+		ExpectedTerm    uint64
+	}
+
+	for _, tu := range []tuple{
+		{0, 0, defaultTerm},
+		{1, 0, defaultTerm},
+		{2, 0, defaultTerm},
+		{3, 0, defaultTerm},
+		{4, 0, defaultTerm},
+	} {
+		entries, term := log.EntriesAfter(tu.After, defaultTerm)
+		if expected, got := tu.ExpectedEntries, len(entries); expected != got {
+			t.Errorf("with %d, After(%d): entries: expected %d got %d", 0, tu.After, expected, got)
+		}
+		if expected, got := tu.ExpectedTerm, term; expected != got {
+			t.Errorf("with %d, After(%d): expected %d got %d", 0, tu.After, expected, got)
+		}
+	}
+
+	log.AppendEntry(raft.LogEntry{1, 1, c})
+	for _, tu := range []tuple{
+		{0, 1, 1},
+		{1, 0, defaultTerm},
+		{2, 0, defaultTerm},
+		{3, 0, defaultTerm},
+		{4, 0, defaultTerm},
+	} {
+		entries, term := log.EntriesAfter(tu.After, defaultTerm)
+		if expected, got := tu.ExpectedEntries, len(entries); expected != got {
+			t.Errorf("with %d, After(%d): entries: expected %d got %d", 1, tu.After, expected, got)
+		}
+		if expected, got := tu.ExpectedTerm, term; expected != got {
+			t.Errorf("with %d, After(%d): term: expected %d got %d", 1, tu.After, expected, got)
+		}
+	}
+
+	log.AppendEntry(raft.LogEntry{2, 1, c})
+	for _, tu := range []tuple{
+		{0, 2, 1},
+		{1, 1, 1},
+		{2, 0, defaultTerm},
+		{3, 0, defaultTerm},
+		{4, 0, defaultTerm},
+	} {
+		entries, term := log.EntriesAfter(tu.After, defaultTerm)
+		if expected, got := tu.ExpectedEntries, len(entries); expected != got {
+			t.Errorf("with %d, After(%d): entries: expected %d got %d", 2, tu.After, expected, got)
+		}
+		if expected, got := tu.ExpectedTerm, term; expected != got {
+			t.Errorf("with %d, After(%d): term: expected %d got %d", 2, tu.After, expected, got)
+		}
+	}
+
+	log.AppendEntry(raft.LogEntry{3, 2, c})
+	for _, tu := range []tuple{
+		{0, 3, 2},
+		{1, 2, 2},
+		{2, 1, 2},
+		{3, 0, defaultTerm},
+		{4, 0, defaultTerm},
+	} {
+		entries, term := log.EntriesAfter(tu.After, defaultTerm)
+		if expected, got := tu.ExpectedEntries, len(entries); expected != got {
+			t.Errorf("with %d, After(%d): entries: expected %d got %d", 3, tu.After, expected, got)
+		}
+		if expected, got := tu.ExpectedTerm, term; expected != got {
+			t.Errorf("with %d, After(%d): term: expected %d got %d", 3, tu.After, expected, got)
+		}
+	}
+}
+
 func TestLogEntryEncodeDecode(t *testing.T) {
 	for _, logEntry := range []raft.LogEntry{
 		raft.LogEntry{1, 1, []byte(`{}`)},
