@@ -44,8 +44,8 @@ type Server struct {
 	vote              uint64 // who we voted for this term, if applicable
 	Log               *Log
 	peers             Peers
-	appendEntriesChan chan AppendEntriesRPC
-	requestVoteChan   chan RequestVoteRPC
+	appendEntriesChan chan appendEntriesTuple
+	requestVoteChan   chan requestVoteTuple
 	commandChan       chan commandTuple
 	electionTick      <-chan time.Time
 }
@@ -61,8 +61,8 @@ func NewServer(id uint64, store io.Writer, apply func([]byte) ([]byte, error)) *
 		Term:              1,        // TODO is this correct?
 		Log:               NewLog(store, apply),
 		peers:             nil,
-		appendEntriesChan: make(chan AppendEntriesRPC),
-		requestVoteChan:   make(chan RequestVoteRPC),
+		appendEntriesChan: make(chan appendEntriesTuple),
+		requestVoteChan:   make(chan requestVoteTuple),
 		commandChan:       make(chan commandTuple),
 		electionTick:      time.NewTimer(ElectionTimeout()).C, // one-shot
 	}
@@ -94,23 +94,21 @@ func (s *Server) Command(cmd []byte) ([]byte, error) {
 }
 
 func (s *Server) AppendEntries(ae AppendEntries) AppendEntriesResponse {
-	rpc := AppendEntriesRPC{
+	t := appendEntriesTuple{
 		Request:  ae,
 		Response: make(chan AppendEntriesResponse),
 	}
-
-	s.appendEntriesChan <- rpc
-	return <-rpc.Response
+	s.appendEntriesChan <- t
+	return <-t.Response
 }
 
 func (s *Server) RequestVote(rv RequestVote) RequestVoteResponse {
-	rpc := RequestVoteRPC{
+	t := requestVoteTuple{
 		Request:  rv,
 		Response: make(chan RequestVoteResponse),
 	}
-
-	s.requestVoteChan <- rpc
-	return <-rpc.Response
+	s.requestVoteChan <- t
+	return <-t.Response
 }
 
 func (s *Server) SetPeers(p Peers) {
@@ -197,15 +195,15 @@ func (s *Server) followerSelect() {
 			s.resetElectionTimeout()
 			return
 
-		case rpc := <-s.appendEntriesChan:
-			resp, stepDown := s.handleAppendEntries(rpc.Request)
-			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+		case t := <-s.appendEntriesChan:
+			resp, stepDown := s.handleAppendEntries(t.Request)
+			s.logAppendEntriesResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 
-		case rpc := <-s.requestVoteChan:
-			resp, stepDown := s.handleRequestVote(rpc.Request)
-			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+		case t := <-s.requestVoteChan:
+			resp, stepDown := s.handleRequestVote(t.Request)
+			s.logRequestVoteResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 		}
 	}
 }
@@ -261,27 +259,27 @@ func (s *Server) candidateSelect() {
 				return // win
 			}
 
-		case rpc := <-s.appendEntriesChan:
+		case t := <-s.appendEntriesChan:
 			// "While waiting for votes, a candidate may receive an
 			// AppendEntries RPC from another server claiming to be leader.
 			// If the leader's term (included in its RPC) is at least as
 			// large as the candidate's current term, then the candidate
 			// recognizes the leader as legitimate and steps down, meaning
 			// that it returns to follower state."
-			resp, stepDown := s.handleAppendEntries(rpc.Request)
-			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+			resp, stepDown := s.handleAppendEntries(t.Request)
+			s.logAppendEntriesResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 			if stepDown {
 				s.logGeneric("stepping down to Follower")
 				s.State = Follower
 				return // lose
 			}
 
-		case rpc := <-s.requestVoteChan:
+		case t := <-s.requestVoteChan:
 			// We can also be defeated by a more recent candidate
-			resp, stepDown := s.handleRequestVote(rpc.Request)
-			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+			resp, stepDown := s.handleRequestVote(t.Request)
+			s.logRequestVoteResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 			if stepDown {
 				s.logGeneric("stepping down to Follower")
 				s.State = Follower
@@ -477,19 +475,19 @@ func (s *Server) leaderSelect() {
 				}
 			}
 
-		case rpc := <-s.appendEntriesChan:
-			resp, stepDown := s.handleAppendEntries(rpc.Request)
-			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+		case t := <-s.appendEntriesChan:
+			resp, stepDown := s.handleAppendEntries(t.Request)
+			s.logAppendEntriesResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 			if stepDown {
 				s.State = Follower
 				return
 			}
 
-		case rpc := <-s.requestVoteChan:
-			resp, stepDown := s.handleRequestVote(rpc.Request)
-			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
-			rpc.Response <- resp
+		case t := <-s.requestVoteChan:
+			resp, stepDown := s.handleRequestVote(t.Request)
+			s.logRequestVoteResponse(t.Request, resp, stepDown)
+			t.Response <- resp
 			if stepDown {
 				s.State = Follower
 				return

@@ -1,11 +1,11 @@
 package raft
 
-type AppendEntriesRPC struct {
+type appendEntriesTuple struct {
 	Request  AppendEntries
 	Response chan AppendEntriesResponse
 }
 
-type RequestVoteRPC struct {
+type requestVoteTuple struct {
 	Request  RequestVote
 	Response chan RequestVoteResponse
 }
