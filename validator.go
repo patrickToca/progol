@@ -220,7 +220,6 @@ func pingOne(url url.URL, timeout time.Duration) Peer {
 	case err := <-e:
 		return Peer{url, err == nil}
 	}
-	panic("unreachable")
 }
 
 func ping(peer url.URL) error {
