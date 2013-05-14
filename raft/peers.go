@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"time"
 )
@@ -18,8 +16,8 @@ var (
 // be 1:1 with a Server.
 type Peer interface {
 	Id() uint64
-	AppendEntries(AppendEntries) (AppendEntriesResponse, error)
-	RequestVote(RequestVote) (RequestVoteResponse, error)
+	AppendEntries(AppendEntries) AppendEntriesResponse
+	RequestVote(RequestVote) RequestVoteResponse
 }
 
 // LocalPeer is the simplest kind of Peer, mapped to a Server in the
@@ -33,50 +31,21 @@ func NewLocalPeer(server *Server) *LocalPeer { return &LocalPeer{server} }
 
 func (p *LocalPeer) Id() uint64 { return p.server.Id }
 
-func (p *LocalPeer) AppendEntries(ae AppendEntries) (AppendEntriesResponse, error) {
-	b := &bytes.Buffer{}
-	d := make(chan struct{})
-	p.server.Incoming(RPC{
-		Procedure: ae,
-		Writer:    b,
-		Done:      d,
-	})
-	<-d
-
-	var aer AppendEntriesResponse
-	err := json.NewDecoder(b).Decode(&aer)
-	return aer, err
+func (p *LocalPeer) AppendEntries(ae AppendEntries) AppendEntriesResponse {
+	return p.server.AppendEntries(ae)
 }
 
-func (p *LocalPeer) RequestVote(rv RequestVote) (RequestVoteResponse, error) {
-	b := &bytes.Buffer{}
-	d := make(chan struct{})
-	p.server.Incoming(RPC{
-		Procedure: rv,
-		Writer:    b,
-		Done:      d,
-	})
-	<-d
-
-	var rvr RequestVoteResponse
-	err := json.NewDecoder(b).Decode(&rvr)
-	return rvr, err
+func (p *LocalPeer) RequestVote(rv RequestVote) RequestVoteResponse {
+	return p.server.RequestVote(rv)
 }
 
-func DoRequestVote(p Peer, r RequestVote, timeout time.Duration) (RequestVoteResponse, error) {
-	type tuple struct {
-		Response RequestVoteResponse
-		Err      error
-	}
-	c := make(chan tuple)
-	go func() {
-		rvr, err := p.RequestVote(r)
-		c <- tuple{rvr, err}
-	}()
+func DoRequestVote(p Peer, rv RequestVote, timeout time.Duration) (RequestVoteResponse, error) {
+	c := make(chan RequestVoteResponse)
+	go func() { c <- p.RequestVote(rv) }()
 
 	select {
-	case t := <-c:
-		return t.Response, t.Err
+	case resp := <-c:
+		return resp, nil
 	case <-time.After(timeout):
 		return RequestVoteResponse{}, ErrTimeout
 	}

@@ -38,15 +38,16 @@ func BroadcastInterval() time.Duration {
 }
 
 type Server struct {
-	Id           uint64 // of this server, for elections and redirects
-	State        string
-	Term         uint64 // "current term number, which increases monotonically"
-	vote         uint64 // who we voted for this term, if applicable
-	Log          *Log
-	peers        Peers
-	rpcChan      chan RPC // TODO separate channels for each RPC type
-	commandChan  chan commandTuple
-	electionTick <-chan time.Time
+	Id                uint64 // of this server, for elections and redirects
+	State             string
+	Term              uint64 // "current term number, which increases monotonically"
+	vote              uint64 // who we voted for this term, if applicable
+	Log               *Log
+	peers             Peers
+	appendEntriesChan chan AppendEntriesRPC
+	requestVoteChan   chan RequestVoteRPC
+	commandChan       chan commandTuple
+	electionTick      <-chan time.Time
 }
 
 func NewServer(id uint64, store io.Writer, apply func([]byte) ([]byte, error)) *Server {
@@ -55,14 +56,15 @@ func NewServer(id uint64, store io.Writer, apply func([]byte) ([]byte, error)) *
 	}
 
 	s := &Server{
-		Id:           id,
-		State:        Follower, // "when servers start up they begin as followers"
-		Term:         1,        // TODO is this correct?
-		Log:          NewLog(store, apply),
-		peers:        nil,
-		rpcChan:      make(chan RPC),
-		commandChan:  make(chan commandTuple),
-		electionTick: time.NewTimer(ElectionTimeout()).C, // one-shot
+		Id:                id,
+		State:             Follower, // "when servers start up they begin as followers"
+		Term:              1,        // TODO is this correct?
+		Log:               NewLog(store, apply),
+		peers:             nil,
+		appendEntriesChan: make(chan AppendEntriesRPC),
+		requestVoteChan:   make(chan RequestVoteRPC),
+		commandChan:       make(chan commandTuple),
+		electionTick:      time.NewTimer(ElectionTimeout()).C, // one-shot
 	}
 	return s
 }
@@ -91,8 +93,24 @@ func (s *Server) Command(cmd []byte) ([]byte, error) {
 	}
 }
 
-func (s *Server) Incoming(rpc RPC) {
-	s.rpcChan <- rpc
+func (s *Server) AppendEntries(ae AppendEntries) AppendEntriesResponse {
+	rpc := AppendEntriesRPC{
+		Request:  ae,
+		Response: make(chan AppendEntriesResponse),
+	}
+
+	s.appendEntriesChan <- rpc
+	return <-rpc.Response
+}
+
+func (s *Server) RequestVote(rv RequestVote) RequestVoteResponse {
+	rpc := RequestVoteRPC{
+		Request:  rv,
+		Response: make(chan RequestVoteResponse),
+	}
+
+	s.requestVoteChan <- rpc
+	return <-rpc.Response
 }
 
 func (s *Server) SetPeers(p Peers) {
@@ -179,17 +197,15 @@ func (s *Server) followerSelect() {
 			s.resetElectionTimeout()
 			return
 
-		case rpc := <-s.rpcChan:
-			switch r := rpc.Request().(type) {
-			case AppendEntries:
-				resp, stepDown := s.handleAppendEntries(r)
-				s.logAppendEntriesResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-			case RequestVote:
-				resp, stepDown := s.handleRequestVote(r)
-				s.logRequestVoteResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-			}
+		case rpc := <-s.appendEntriesChan:
+			resp, stepDown := s.handleAppendEntries(rpc.Request)
+			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
+
+		case rpc := <-s.requestVoteChan:
+			resp, stepDown := s.handleRequestVote(rpc.Request)
+			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
 		}
 	}
 }
@@ -245,33 +261,31 @@ func (s *Server) candidateSelect() {
 				return // win
 			}
 
-		case rpc := <-s.rpcChan:
-			switch r := rpc.Request().(type) {
-			case AppendEntries:
-				// "While waiting for votes, a candidate may receive an
-				// AppendEntries RPC from another server claiming to be leader.
-				// If the leader's term (included in its RPC) is at least as
-				// large as the candidate's current term, then the candidate
-				// recognizes the leader as legitimate and steps down, meaning
-				// that it returns to follower state."
-				resp, stepDown := s.handleAppendEntries(r)
-				s.logAppendEntriesResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-				if stepDown {
-					s.logGeneric("stepping down to Follower")
-					s.State = Follower
-					return // lose
-				}
-			case RequestVote:
-				// We can also be defeated by a more recent candidate
-				resp, stepDown := s.handleRequestVote(r)
-				s.logRequestVoteResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-				if stepDown {
-					s.logGeneric("stepping down to Follower")
-					s.State = Follower
-					return // lose
-				}
+		case rpc := <-s.appendEntriesChan:
+			// "While waiting for votes, a candidate may receive an
+			// AppendEntries RPC from another server claiming to be leader.
+			// If the leader's term (included in its RPC) is at least as
+			// large as the candidate's current term, then the candidate
+			// recognizes the leader as legitimate and steps down, meaning
+			// that it returns to follower state."
+			resp, stepDown := s.handleAppendEntries(rpc.Request)
+			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
+			if stepDown {
+				s.logGeneric("stepping down to Follower")
+				s.State = Follower
+				return // lose
+			}
+
+		case rpc := <-s.requestVoteChan:
+			// We can also be defeated by a more recent candidate
+			resp, stepDown := s.handleRequestVote(rpc.Request)
+			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
+			if stepDown {
+				s.logGeneric("stepping down to Follower")
+				s.State = Follower
+				return // lose
 			}
 
 		case <-s.electionTick: //  "a period of time goes by with no winner"
@@ -345,7 +359,7 @@ func (s *Server) Flush(peer Peer, ni *nextIndex) error {
 	prevLogIndex := ni.PrevLogIndex(peerId)
 	entries, prevLogTerm := s.Log.EntriesAfter(prevLogIndex, currentTerm)
 	commitIndex := s.Log.CommitIndex()
-	resp, err := peer.AppendEntries(AppendEntries{
+	resp := peer.AppendEntries(AppendEntries{
 		Term:         currentTerm,
 		LeaderId:     s.Id,
 		PrevLogIndex: prevLogIndex,
@@ -353,9 +367,6 @@ func (s *Server) Flush(peer Peer, ni *nextIndex) error {
 		Entries:      entries,
 		CommitIndex:  commitIndex,
 	})
-	if err != nil {
-		return err
-	}
 	if resp.Term > currentTerm {
 		return ErrDeposed
 	}
@@ -466,24 +477,22 @@ func (s *Server) leaderSelect() {
 				}
 			}
 
-		case rpc := <-s.rpcChan:
-			switch r := rpc.Request().(type) {
-			case AppendEntries:
-				resp, stepDown := s.handleAppendEntries(r)
-				s.logAppendEntriesResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-				if stepDown {
-					s.State = Follower
-					return
-				}
-			case RequestVote:
-				resp, stepDown := s.handleRequestVote(r)
-				s.logRequestVoteResponse(r, resp, stepDown)
-				rpc.Respond(resp)
-				if stepDown {
-					s.State = Follower
-					return
-				}
+		case rpc := <-s.appendEntriesChan:
+			resp, stepDown := s.handleAppendEntries(rpc.Request)
+			s.logAppendEntriesResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
+			if stepDown {
+				s.State = Follower
+				return
+			}
+
+		case rpc := <-s.requestVoteChan:
+			resp, stepDown := s.handleRequestVote(rpc.Request)
+			s.logRequestVoteResponse(rpc.Request, resp, stepDown)
+			rpc.Response <- resp
+			if stepDown {
+				s.State = Follower
+				return
 			}
 		}
 	}

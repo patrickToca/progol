@@ -1,24 +1,13 @@
 package raft
 
-import (
-	"encoding/json"
-	"io"
-)
-
-type RPC struct {
-	Procedure interface{}   // AppendEntries or RequestVote
-	Writer    io.Writer     // where the Server will write the Response
-	Done      chan struct{} // signal the Server is finished
+type AppendEntriesRPC struct {
+	Request  AppendEntries
+	Response chan AppendEntriesResponse
 }
 
-func (rpc *RPC) Request() interface{} {
-	return rpc.Procedure
-}
-
-func (rpc *RPC) Respond(resp interface{}) error {
-	err := json.NewEncoder(rpc.Writer).Encode(resp)
-	close(rpc.Done)
-	return err
+type RequestVoteRPC struct {
+	Request  RequestVote
+	Response chan RequestVoteResponse
 }
 
 type AppendEntries struct {
