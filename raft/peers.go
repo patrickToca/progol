@@ -39,7 +39,7 @@ func (p *LocalPeer) RequestVote(rv RequestVote) RequestVoteResponse {
 	return p.server.RequestVote(rv)
 }
 
-func DoRequestVote(p Peer, rv RequestVote, timeout time.Duration) (RequestVoteResponse, error) {
+func RequestVoteTimeout(p Peer, rv RequestVote, timeout time.Duration) (RequestVoteResponse, error) {
 	c := make(chan RequestVoteResponse)
 	go func() { c <- p.RequestVote(rv) }()
 
@@ -79,10 +79,10 @@ func (p Peers) Quorum() int {
 
 // RequestVotes sends the passed RequestVote RPC to every peer in Peers. It
 // forwards responses along the returned RequestVoteResponse channel. It calls
-// DoRequestVote with a timeout of BroadcastInterval * 2 (chosen arbitrarily).
-// Peers that don't respond within the timeout are retried forever. The retry
-// loop stops only when all peers have responded, or a Cancel signal is sent via
-// the returned Canceler.
+// RequestVoteTimeout with a timeout of BroadcastInterval * 2 (chosen
+// arbitrarily). Peers that don't respond within the timeout are retried
+// forever. The retry loop stops only when all peers have responded, or a Cancel
+// signal is sent via the returned Canceler.
 func (p Peers) RequestVotes(r RequestVote) (chan RequestVoteResponse, Canceler) {
 	// "[A server entering the candidate stage] issues RequestVote RPCs in
 	// parallel to each of the other servers in the cluster. If the candidate
@@ -112,26 +112,25 @@ func (p Peers) RequestVotes(r RequestVote) (chan RequestVoteResponse, Canceler) 
 			}
 
 			// scatter
-			tupleChans := map[uint64]chan tuple{}
+			tupleChan := make(chan tuple, len(notYetResponded))
 			for id, peer := range notYetResponded {
-				tupleChans[id] = make(chan tuple)
 				go func(id0 uint64, peer0 Peer) {
-					resp, err := DoRequestVote(peer0, r, 2*BroadcastInterval())
-					tupleChans[id0] <- tuple{id0, resp, err}
+					resp, err := RequestVoteTimeout(peer0, r, 2*BroadcastInterval())
+					tupleChan <- tuple{id0, resp, err}
 				}(id, peer)
 			}
 
 			// gather
-			for id, tupleChan := range tupleChans {
+			for i := 0; i < len(notYetResponded); i++ {
 				select {
 				case t := <-tupleChan:
 					if t.Err != nil {
 						continue // will need to retry
 					}
-					respondedAlready[id] = nil             // value irrelevant
+					respondedAlready[t.Id] = nil           // value irrelevant
 					responsesChan <- t.RequestVoteResponse // forward the vote
 				case <-abortChan:
-					return
+					return // give up
 				}
 			}
 		}

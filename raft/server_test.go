@@ -26,22 +26,41 @@ func (p nonresponsivePeer) RequestVote(raft.RequestVote) raft.RequestVoteRespons
 }
 
 func TestFollowerToCandidate(t *testing.T) {
+	log.SetOutput(&bytes.Buffer{})
+	defer log.SetOutput(os.Stdout)
+
 	noop := func([]byte) ([]byte, error) { return []byte{}, nil }
 	server := raft.NewServer(1, &bytes.Buffer{}, noop)
 	server.SetPeers(raft.Peers{
 		2: nonresponsivePeer(2),
 		3: nonresponsivePeer(3),
 	})
-	server.Start()
-
-	if server.State != raft.Follower {
+	if server.State.Get() != raft.Follower {
 		t.Fatalf("didn't start as Follower")
+	}
+
+	server.Start()
+	began := time.Now()
+	cutoff := began.Add(2 * raft.ElectionTimeout())
+	backoff := raft.BroadcastInterval()
+	for {
+		if time.Now().After(cutoff) {
+			t.Fatal("failed to become Candidate")
+		}
+		if state := server.State.Get(); state != raft.Candidate {
+			t.Logf("after %15s, %s; retry", time.Since(began), state)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		t.Logf("became Candidate after %s", time.Since(began))
+		break
 	}
 
 	d := 2 * raft.ElectionTimeout()
 	time.Sleep(d)
 
-	if server.State != raft.Candidate {
+	if server.State.Get() != raft.Candidate {
 		t.Fatalf("after %s, not Candidate", d.String())
 	}
 }
@@ -66,14 +85,27 @@ func TestCandidateToLeader(t *testing.T) {
 	noop := func([]byte) ([]byte, error) { return []byte{}, nil }
 	server := raft.NewServer(1, &bytes.Buffer{}, noop)
 	server.SetPeers(raft.Peers{
+		1: nonresponsivePeer(1),
 		2: approvingPeer(2),
 		3: nonresponsivePeer(3),
 	})
 	server.Start()
 
-	time.Sleep(2 * raft.ElectionTimeout())
-	if server.State != raft.Leader {
-		t.Fatalf("didn't become Leader")
+	began := time.Now()
+	cutoff := began.Add(2 * raft.ElectionTimeout())
+	backoff := raft.BroadcastInterval()
+	for {
+		if time.Now().After(cutoff) {
+			t.Fatal("failed to become Leader")
+		}
+		if state := server.State.Get(); state != raft.Leader {
+			t.Logf("after %15s, %s; retry", time.Since(began), state)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		t.Logf("became Leader after %s", time.Since(began))
+		break
 	}
 }
 
@@ -103,12 +135,16 @@ func TestFailedElection(t *testing.T) {
 	server.Start()
 
 	time.Sleep(2 * raft.ElectionTimeout())
-	if server.State == raft.Leader {
+	if server.State.Get() == raft.Leader {
 		t.Fatalf("erroneously became Leader")
 	}
+	t.Logf("failed to become Leader in non-responsive cluster (good)")
 }
 
 func TestSimpleConsensus(t *testing.T) {
+	log.SetOutput(&bytes.Buffer{})
+	defer log.SetOutput(os.Stdout)
+
 	type SetValue struct {
 		Value int32 `json:"value"`
 	}
@@ -159,7 +195,7 @@ func TestSimpleConsensus(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		d := 10 * time.Millisecond
+		d := raft.BroadcastInterval()
 		for {
 			i1l := atomic.LoadInt32(&i1)
 			i2l := atomic.LoadInt32(&i2)
@@ -180,12 +216,4 @@ func TestSimpleConsensus(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Errorf("timeout")
 	}
-
-	t.Logf(
-		"final: i1=%02d i2=%02d i3=%02d",
-		atomic.LoadInt32(&i1),
-		atomic.LoadInt32(&i2),
-		atomic.LoadInt32(&i3),
-	)
-	time.Sleep(raft.ElectionTimeout())
 }

@@ -37,9 +37,26 @@ func BroadcastInterval() time.Duration {
 	return time.Duration(d) * time.Millisecond
 }
 
+type concurrentState struct {
+	sync.RWMutex
+	value string
+}
+
+func (s *concurrentState) Get() string {
+	s.RLock()
+	defer s.RUnlock()
+	return s.value
+}
+
+func (s *concurrentState) Set(value string) {
+	s.Lock()
+	defer s.Unlock()
+	s.value = value
+}
+
 type Server struct {
 	Id                uint64 // of this server, for elections and redirects
-	State             string
+	State             *concurrentState
 	Term              uint64 // "current term number, which increases monotonically"
 	vote              uint64 // who we voted for this term, if applicable
 	Log               *Log
@@ -57,8 +74,8 @@ func NewServer(id uint64, store io.Writer, apply func([]byte) ([]byte, error)) *
 
 	s := &Server{
 		Id:                id,
-		State:             Follower, // "when servers start up they begin as followers"
-		Term:              1,        // TODO is this correct?
+		State:             &concurrentState{value: Follower}, // "when servers start up they begin as followers"
+		Term:              1,                                 // TODO is this correct?
 		Log:               NewLog(store, apply),
 		peers:             nil,
 		appendEntriesChan: make(chan appendEntriesTuple),
@@ -135,7 +152,7 @@ func (s *Server) SetPeers(p Peers) {
 
 func (s *Server) loop() {
 	for {
-		switch s.State {
+		switch s.State.Get() {
 		case Follower:
 			s.followerSelect()
 		case Candidate:
@@ -153,7 +170,7 @@ func (s *Server) resetElectionTimeout() {
 }
 
 func (s *Server) logGeneric(format string, args ...interface{}) {
-	prefix := fmt.Sprintf("id=%d term=%d state=%s: ", s.Id, s.Term, s.State)
+	prefix := fmt.Sprintf("id=%d term=%d state=%s: ", s.Id, s.Term, s.State.Get())
 	log.Printf(prefix+format, args...)
 }
 
@@ -191,7 +208,7 @@ func (s *Server) followerSelect() {
 			// transitions to candidate state."
 			s.logGeneric("election timeout, becoming candidate")
 			s.Term++
-			s.State = Candidate
+			s.State.Set(Candidate)
 			s.resetElectionTimeout()
 			return
 
@@ -228,7 +245,7 @@ func (s *Server) candidateSelect() {
 	// catch a bad state
 	if votesReceived >= votesRequired {
 		s.logGeneric("%d-node cluster; I win", s.peers.Count())
-		s.State = Leader
+		s.State.Set(Leader)
 		return
 	}
 
@@ -255,7 +272,7 @@ func (s *Server) candidateSelect() {
 			// "Once a candidate wins an election, it becomes leader."
 			if votesReceived >= votesRequired {
 				s.logGeneric("%d >= %d: win", votesReceived, votesRequired)
-				s.State = Leader
+				s.State.Set(Leader)
 				return // win
 			}
 
@@ -271,7 +288,7 @@ func (s *Server) candidateSelect() {
 			t.Response <- resp
 			if stepDown {
 				s.logGeneric("stepping down to Follower")
-				s.State = Follower
+				s.State.Set(Follower)
 				return // lose
 			}
 
@@ -282,7 +299,7 @@ func (s *Server) candidateSelect() {
 			t.Response <- resp
 			if stepDown {
 				s.logGeneric("stepping down to Follower")
-				s.State = Follower
+				s.State.Set(Follower)
 				return // lose
 			}
 
@@ -340,10 +357,6 @@ func (ni *nextIndex) Set(id, index uint64) {
 	ni.m[id] = index
 }
 
-//
-//
-//
-
 // Flush generates and forwards an AppendEntries request that attempts to bring
 // the given follower "in sync" with our log. It's idempotent, so it's used for
 // both heartbeats and replicating commands.
@@ -378,10 +391,6 @@ func (s *Server) Flush(peer Peer, ni *nextIndex) error {
 	}
 	return nil
 }
-
-//
-//
-//
 
 func (s *Server) leaderSelect() {
 	// 5.3 Log replication: "The leader maintains a nextIndex for each follower,
@@ -467,20 +476,31 @@ func (s *Server) leaderSelect() {
 		case <-heartbeatTick:
 			// Heartbeats attempt to sync the follower log with ours.
 			// That requires per-follower state in the form of nextIndex.
-			// TODO parallelize
-			for _, peer := range s.peers.Except(s.Id) {
-				err := s.Flush(peer, ni)
-				if err != nil {
-					s.logGeneric("heartbeat: flush to %d: %s (nextIndex now %d)", peer.Id(), err, ni.PrevLogIndex(peer.Id()))
-				}
+			recipients := s.peers.Except(s.Id)
+			wg := sync.WaitGroup{}
+			wg.Add(len(recipients))
+			for _, peer := range recipients {
+				go func(peer0 Peer) {
+					defer wg.Done()
+					err := s.Flush(peer0, ni)
+					if err != nil {
+						s.logGeneric(
+							"heartbeat: flush to %d: %s (nextIndex now %d)",
+							peer0.Id(),
+							err,
+							ni.PrevLogIndex(peer0.Id()),
+						)
+					}
+				}(peer)
 			}
+			wg.Wait()
 
 		case t := <-s.appendEntriesChan:
 			resp, stepDown := s.handleAppendEntries(t.Request)
 			s.logAppendEntriesResponse(t.Request, resp, stepDown)
 			t.Response <- resp
 			if stepDown {
-				s.State = Follower
+				s.State.Set(Follower)
 				return
 			}
 
@@ -489,7 +509,7 @@ func (s *Server) leaderSelect() {
 			s.logRequestVoteResponse(t.Request, resp, stepDown)
 			t.Response <- resp
 			if stepDown {
-				s.State = Follower
+				s.State.Set(Follower)
 				return
 			}
 		}
