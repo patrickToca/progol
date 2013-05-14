@@ -89,7 +89,6 @@ func (s *Server) Command(cmd []byte) ([]byte, error) {
 	case err := <-t.Err:
 		return []byte{}, err
 	}
-	panic("unreachable")
 }
 
 func (s *Server) Incoming(rpc RPC) {
@@ -366,7 +365,6 @@ func (s *Server) Flush(peer Peer, ni *nextIndex) error {
 	}
 
 	if len(entries) > 0 {
-		s.logGeneric("### after successful Flush, peer=%d gets nextIndex=%d", peer.Id(), entries[len(entries)-1].Index)
 		ni.Set(peer.Id(), entries[len(entries)-1].Index)
 	}
 	return nil
@@ -456,7 +454,6 @@ func (s *Server) leaderSelect() {
 				commandTuple.Response <- []byte{} // TODO actual response
 				continue
 			}
-			panic("unreachable")
 
 		case <-heartbeatTick:
 			// Heartbeats attempt to sync the follower log with ours.

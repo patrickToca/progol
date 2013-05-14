@@ -146,7 +146,6 @@ func TestSimpleConsensus(t *testing.T) {
 	s3.Start()
 
 	time.Sleep(2 * raft.ElectionTimeout())
-	log.Printf("### s1=%s s2=%s s3=%s", s1.State, s2.State, s3.State)
 
 	cmd := SetValue{42}
 	cmdBuf, err := json.Marshal(cmd)
@@ -154,11 +153,10 @@ func TestSimpleConsensus(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp, err := s1.Command(cmdBuf)
-	log.Printf("### %v %v", resp, err)
 	if err != nil {
 		t.Fatal(err)
 	}
-	log.Printf("### command response: %s", resp)
+	t.Logf("Command response: %s", resp)
 
 	done := make(chan struct{})
 	go func() {

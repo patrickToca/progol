@@ -165,9 +165,6 @@ func TestLogAppend(t *testing.T) {
 	if err := log.CommitTo(1); err != raft.ErrIndexTooSmall {
 		t.Errorf("Commit: expected ErrIndexTooSmall, got %v", err)
 	}
-	if err := log.CommitTo(2); err != raft.ErrIndexTooSmall {
-		t.Errorf("Commit: expected ErrIndexTooSmall, got %v", err)
-	}
 	if err := log.CommitTo(4); err != raft.ErrIndexTooBig {
 		t.Errorf("Commit: expected ErrIndexTooBig, got %v", err)
 	}

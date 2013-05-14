@@ -80,7 +80,6 @@ func DoRequestVote(p Peer, r RequestVote, timeout time.Duration) (RequestVoteRes
 	case <-time.After(timeout):
 		return RequestVoteResponse{}, ErrTimeout
 	}
-	panic("unreachable")
 }
 
 // Peers is a collection of Peer interfaces. It provides some convenience
@@ -107,7 +106,6 @@ func (p Peers) Quorum() int {
 	default:
 		return (n / 2) + 1
 	}
-	panic("unreachable")
 }
 
 // RequestVotes sends the passed RequestVote RPC to every peer in Peers. It
